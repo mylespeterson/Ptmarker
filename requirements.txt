@@ -1,0 +1,2 @@
+# Ptmarker requires only the Python standard library — no third-party packages needed.
+# Python 3.8 or higher is recommended.
