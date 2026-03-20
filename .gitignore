@@ -1,0 +1,17 @@
+# Python cache / compiled files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Output files
+results.csv
+
+# OS metadata
+.DS_Store
+Thumbs.db
