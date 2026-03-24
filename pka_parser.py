@@ -5,6 +5,7 @@ Logic to unzip .pka Cisco Packet Tracer activity files, parse the embedded XML,
 and extract the score, max score, and user profile name.
 """
 
+import io
 import logging
 import zipfile
 import xml.etree.ElementTree as ET
@@ -23,6 +24,47 @@ _PROFILE_TAGS = ("USERPROFILENAME", "UserProfileName", "userProfileName",
 
 # XML file names that are most likely to contain scoring data inside the archive.
 _PREFERRED_XML_FILES = ("default.xml", "activity.xml", "scoring.xml")
+
+# Standard ZIP local-file-header signature.
+_ZIP_SIGNATURE = b"PK\x03\x04"
+
+
+def _open_pka_as_zip(filepath):
+    """Open a `.pka` file and return a :class:`zipfile.ZipFile`.
+
+    Packet Tracer `.pka` files are ZIP archives, but some versions prepend a
+    proprietary binary header before the ZIP data.  This helper first tries to
+    open the file directly; if that fails it scans for the ZIP local-file-header
+    signature (``PK\\x03\\x04``) and retries from that offset.
+
+    Args:
+        filepath: Path (str) to the `.pka` file.
+
+    Returns:
+        A :class:`zipfile.ZipFile` opened for reading.  The caller is
+        responsible for closing it.
+
+    Raises:
+        zipfile.BadZipFile: If no valid ZIP data can be found in the file.
+    """
+    # Fast path: try opening directly — works for standard ZIP-based PKA files.
+    try:
+        return zipfile.ZipFile(filepath, "r")
+    except zipfile.BadZipFile:
+        pass
+
+    # Slow path: read raw bytes, locate the ZIP signature, and retry.
+    with open(filepath, "rb") as fh:
+        raw = fh.read()
+
+    offset = raw.find(_ZIP_SIGNATURE)
+    if offset <= 0:
+        # offset == 0 means the direct open should have worked; -1 means no
+        # ZIP data at all.  Either way, raise the canonical error.
+        raise zipfile.BadZipFile("Not a valid ZIP/PKA archive")
+
+    logger.debug("Found ZIP signature at byte offset %d in %s", offset, filepath)
+    return zipfile.ZipFile(io.BytesIO(raw[offset:]), "r")
 
 
 def _find_text(element, tag_names):
@@ -176,7 +218,7 @@ def parse_pka_file(filepath):
     }
 
     try:
-        with zipfile.ZipFile(filepath, "r") as zf:
+        with _open_pka_as_zip(filepath) as zf:
             names = zf.namelist()
             logger.debug("%s contains entries: %s", filename, names)
 
