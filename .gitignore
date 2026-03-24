@@ -9,6 +9,9 @@ __pycache__/
 venv/
 env/
 
+# Test artifacts
+.pytest_cache/
+
 # Output files
 results.csv
 
