@@ -12,6 +12,7 @@ import pytest
 
 from pka_parser import (
     _open_pka_as_zip,
+    _score_by_config_comparison,
     _tally_comparison_points,
     parse_pka_file,
 )
@@ -280,3 +281,197 @@ class TestComparisonsScoringInParse:
             assert result["error"] is None
         finally:
             os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# Tests for config-comparison scoring
+# ---------------------------------------------------------------------------
+
+class TestConfigComparisonScoring:
+    """Verify that running-config comparison scoring produces correct results."""
+
+    def test_config_comparison_basic(self):
+        """Config comparison scores correctly when student and answer configs differ."""
+        xml_content = b"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<PACKETTRACER5_ACTIVITY>
+  <PACKETTRACER5>
+    <NETWORK>
+      <DEVICES>
+        <DEVICE>
+          <ENGINE>
+            <NAME>R1</NAME>
+            <RUNNINGCONFIG>
+              <LINE>!</LINE>
+              <LINE>hostname R1</LINE>
+              <LINE>ip address 10.0.0.1 255.255.255.0</LINE>
+              <LINE>!</LINE>
+            </RUNNINGCONFIG>
+          </ENGINE>
+        </DEVICE>
+      </DEVICES>
+    </NETWORK>
+  </PACKETTRACER5>
+  <PACKETTRACER5>
+    <NETWORK><DEVICES></DEVICES></NETWORK>
+  </PACKETTRACER5>
+  <PACKETTRACER5>
+    <NETWORK>
+      <DEVICES>
+        <DEVICE>
+          <ENGINE>
+            <NAME>R1</NAME>
+            <RUNNINGCONFIG>
+              <LINE>!</LINE>
+              <LINE>hostname R1</LINE>
+              <LINE>ip address 10.0.0.1 255.255.255.0</LINE>
+              <LINE>ip route 0.0.0.0 0.0.0.0 10.0.0.254</LINE>
+              <LINE>!</LINE>
+            </RUNNINGCONFIG>
+          </ENGINE>
+        </DEVICE>
+      </DEVICES>
+    </NETWORK>
+  </PACKETTRACER5>
+</PACKETTRACER5_ACTIVITY>
+"""
+        path = _write_tmp(_make_zip_bytes(xml_content=xml_content,
+                                          entry_name="default.xml"))
+        try:
+            result = parse_pka_file(path)
+            assert result["error"] is None
+            # Answer has 3 significant lines (hostname, ip address, ip route).
+            # Student has 2 of them (hostname, ip address).
+            assert result["score"] == "2"
+            assert result["max_score"] == "3"
+            assert result["percentage"] == "66.7%"
+        finally:
+            os.unlink(path)
+
+    def test_config_comparison_perfect_score(self):
+        """Config comparison returns 100% when student matches answer exactly."""
+        xml_content = b"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<PACKETTRACER5_ACTIVITY>
+  <PACKETTRACER5>
+    <NETWORK>
+      <DEVICES>
+        <DEVICE>
+          <ENGINE>
+            <NAME>R1</NAME>
+            <RUNNINGCONFIG>
+              <LINE>hostname R1</LINE>
+              <LINE>interface G0/0</LINE>
+              <LINE>ip address 10.0.0.1 255.255.255.0</LINE>
+            </RUNNINGCONFIG>
+          </ENGINE>
+        </DEVICE>
+      </DEVICES>
+    </NETWORK>
+  </PACKETTRACER5>
+  <PACKETTRACER5><NETWORK><DEVICES></DEVICES></NETWORK></PACKETTRACER5>
+  <PACKETTRACER5>
+    <NETWORK>
+      <DEVICES>
+        <DEVICE>
+          <ENGINE>
+            <NAME>R1</NAME>
+            <RUNNINGCONFIG>
+              <LINE>hostname R1</LINE>
+              <LINE>interface G0/0</LINE>
+              <LINE>ip address 10.0.0.1 255.255.255.0</LINE>
+            </RUNNINGCONFIG>
+          </ENGINE>
+        </DEVICE>
+      </DEVICES>
+    </NETWORK>
+  </PACKETTRACER5>
+</PACKETTRACER5_ACTIVITY>
+"""
+        path = _write_tmp(_make_zip_bytes(xml_content=xml_content,
+                                          entry_name="default.xml"))
+        try:
+            result = parse_pka_file(path)
+            assert result["error"] is None
+            assert result["score"] == "3"
+            assert result["max_score"] == "3"
+            assert result["percentage"] == "100.0%"
+        finally:
+            os.unlink(path)
+
+    def test_config_comparison_fallback_to_comparisons(self):
+        """When fewer than 3 PT5 elements exist, COMPARISONS tree is used."""
+        xml_content = b"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<PACKETTRACER5_ACTIVITY>
+  <COMPARISONS>
+    <NODE><POINTS>1</POINTS></NODE>
+    <NODE><POINTS>0</POINTS></NODE>
+  </COMPARISONS>
+</PACKETTRACER5_ACTIVITY>
+"""
+        path = _write_tmp(_make_zip_bytes(xml_content=xml_content,
+                                          entry_name="default.xml"))
+        try:
+            result = parse_pka_file(path)
+            assert result["score"] == "1"
+            assert result["max_score"] == "2"
+        finally:
+            os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# Tests for encrypted PKA files with different student scores
+# ---------------------------------------------------------------------------
+
+_SAMPLE_PKA_DIR = os.path.dirname(__file__)
+_SAMPLE_87 = os.path.join(_SAMPLE_PKA_DIR, "87.pka")
+_SAMPLE_97 = os.path.join(_SAMPLE_PKA_DIR, "97.pka")
+_SAMPLE_99 = os.path.join(_SAMPLE_PKA_DIR, "99.pka")
+_HAS_SAMPLE_PKAS = all(os.path.isfile(p) for p in [_SAMPLE_87, _SAMPLE_97, _SAMPLE_99])
+
+
+@pytest.mark.skipif(not _HAS_SAMPLE_PKAS, reason="sample PKA test files not present")
+class TestDifferentStudentScores:
+    """Verify that different student submissions produce different scores."""
+
+    def test_scores_are_different(self):
+        """Files with different student work must produce different percentages."""
+        results = {}
+        for path in [_SAMPLE_87, _SAMPLE_97, _SAMPLE_99]:
+            r = parse_pka_file(path)
+            results[path] = r
+            assert r["error"] is None, f"{path}: {r['error']}"
+
+        pcts = [results[p]["percentage"] for p in [_SAMPLE_87, _SAMPLE_97, _SAMPLE_99]]
+        assert len(set(pcts)) == 3, f"Expected 3 different percentages, got {pcts}"
+
+        # Verify percentages are in the expected range for each file.
+        pct87 = float(results[_SAMPLE_87]["percentage"].rstrip("%"))
+        pct97 = float(results[_SAMPLE_97]["percentage"].rstrip("%"))
+        pct99 = float(results[_SAMPLE_99]["percentage"].rstrip("%"))
+        assert 80.0 <= pct87 <= 92.0, f"87.pka: expected ~87%, got {pct87}%"
+        assert 93.0 <= pct97 <= 100.0, f"97.pka: expected ~97%, got {pct97}%"
+        assert 97.0 <= pct99 <= 100.0, f"99.pka: expected ~99%, got {pct99}%"
+
+    def test_score_ordering(self):
+        """87.pka < 97.pka < 99.pka in score percentage."""
+        r87 = parse_pka_file(_SAMPLE_87)
+        r97 = parse_pka_file(_SAMPLE_97)
+        r99 = parse_pka_file(_SAMPLE_99)
+
+        pct87 = float(r87["percentage"].rstrip("%"))
+        pct97 = float(r97["percentage"].rstrip("%"))
+        pct99 = float(r99["percentage"].rstrip("%"))
+
+        assert pct87 < pct97 < pct99
+
+    def test_user_profile_names(self):
+        """97.pka and 99.pka should have non-Guest user profile names."""
+        r97 = parse_pka_file(_SAMPLE_97)
+        r99 = parse_pka_file(_SAMPLE_99)
+
+        assert r97["user_profile_name"] != "N/A"
+        assert r97["user_profile_name"] != "Guest"
+        assert r99["user_profile_name"] != "N/A"
+        assert r99["user_profile_name"] != "Guest"
