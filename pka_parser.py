@@ -1,16 +1,26 @@
 """
 pka_parser.py
 
-Logic to unzip .pka Cisco Packet Tracer activity files, parse the embedded XML,
-and extract the score, max score, and user profile name.
+Logic to open .pka Cisco Packet Tracer activity files (ZIP-based or encrypted),
+parse the embedded XML, and extract the score, max score, and user profile name.
 """
 
 import io
 import logging
+import re
 import zipfile
 import xml.etree.ElementTree as ET
 
+from pt_decrypt import decrypt_pka
+
 logger = logging.getLogger(__name__)
+
+# Regex that matches characters illegal in XML 1.0.  Valid chars are:
+#   #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+_ILLEGAL_XML_RE = re.compile(
+    "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f"
+    "\ud800-\udfff\ufdd0-\ufddf\ufffe\uffff]"
+)
 
 # XML tag names to search for score/max-score/user data.
 # Packet Tracer .pka archives embed an XML document whose schema varies slightly
@@ -104,6 +114,47 @@ def _find_attr(element, tag_names, attr_names):
     return None
 
 
+def _tally_comparison_points(comparisons_el):
+    """Walk the ``<COMPARISONS>`` verification tree and tally leaf-node points.
+
+    In Packet Tracer 7.x+ encrypted PKA files, scoring is represented as a
+    tree of ``<NODE>`` elements.  Leaf nodes (those without child ``<NODE>``
+    elements) carry a ``<POINTS>`` value of ``0`` (failed) or ``1`` (passed).
+    Parent nodes aggregate their children.
+
+    Args:
+        comparisons_el: An :class:`~xml.etree.ElementTree.Element` for the
+            ``<COMPARISONS>`` tag.
+
+    Returns:
+        A tuple ``(earned, total)`` of integers.
+    """
+
+    def _walk(node):
+        children = node.findall("NODE")
+        if not children:
+            # Leaf node — count it.
+            points_el = node.find("POINTS")
+            if points_el is not None and points_el.text and points_el.text.strip().isdigit():
+                return int(points_el.text.strip()), 1
+            return 0, 0
+        earned = 0
+        total = 0
+        for child in children:
+            e, t = _walk(child)
+            earned += e
+            total += t
+        return earned, total
+
+    earned = 0
+    total = 0
+    for top_node in comparisons_el.findall("NODE"):
+        e, t = _walk(top_node)
+        earned += e
+        total += t
+    return earned, total
+
+
 def _parse_xml_for_scores(xml_bytes):
     """Parse XML bytes and attempt to extract score, max_score, and user_profile_name.
 
@@ -171,6 +222,21 @@ def _parse_xml_for_scores(xml_bytes):
             # separate score/max values.
             result["_percentage_raw"] = pct_text.rstrip("%").strip()
 
+    # --- COMPARISONS tree fallback (Packet Tracer 7.x+ encrypted format) ---
+    # In newer PKA files the scoring is stored as a tree of verification nodes
+    # under <COMPARISONS>.  Each leaf <NODE> has a <POINTS> element with a
+    # value of 0 (failed) or 1 (passed).  We sum the leaf values to derive
+    # the score and count all leaves for the max.
+    if result["score"] is None or result["max_score"] is None:
+        comparisons = root.find(".//COMPARISONS")
+        if comparisons is not None:
+            earned, total = _tally_comparison_points(comparisons)
+            if total > 0:
+                if result["score"] is None:
+                    result["score"] = str(earned)
+                if result["max_score"] is None:
+                    result["max_score"] = str(total)
+
     # --- User Profile Name ---
     profile_text = _find_text(root, _PROFILE_TAGS)
     if profile_text is None:
@@ -180,12 +246,140 @@ def _parse_xml_for_scores(xml_bytes):
     return result
 
 
+def _apply_parsed_scores(base_result, parsed, filename):
+    """Populate *base_result* from a *parsed* scores dict.
+
+    Shared helper used by both the ZIP path and the encrypted-decryption path
+    so score/percentage calculation logic is not duplicated.
+    """
+    score_str = parsed.get("score")
+    max_str = parsed.get("max_score")
+    profile = parsed.get("user_profile_name") or "N/A"
+
+    base_result["user_profile_name"] = profile
+
+    # Calculate percentage.
+    if score_str and max_str:
+        try:
+            score_val = float(score_str)
+            max_val = float(max_str)
+            if max_val > 0:
+                pct = (score_val / max_val) * 100.0
+                base_result["score"] = score_str
+                base_result["max_score"] = max_str
+                base_result["percentage"] = f"{pct:.1f}%"
+            else:
+                base_result["score"] = score_str
+                base_result["max_score"] = max_str
+                base_result["percentage"] = "N/A"
+        except ValueError:
+            logger.warning("%s: non-numeric score/max_score values ('%s'/'%s').",
+                           filename, score_str, max_str)
+            base_result["score"] = score_str
+            base_result["max_score"] = max_str
+    elif "_percentage_raw" in parsed and parsed["_percentage_raw"]:
+        # We only have a raw percentage; store it directly.
+        base_result["percentage"] = parsed["_percentage_raw"] + "%"
+    else:
+        logger.warning("%s: scoring data not found in XML.", filename)
+        base_result["error"] = "Scoring data not found"
+
+
+def _parse_zip_pka(filepath, filename, base_result):
+    """Try to open *filepath* as a ZIP-based PKA and extract scores.
+
+    Returns ``True`` if the file was successfully opened as a ZIP archive
+    (even if no scores were found inside it), ``False`` if the file is not
+    a valid ZIP and a different strategy should be attempted.
+    """
+    try:
+        with _open_pka_as_zip(filepath) as zf:
+            names = zf.namelist()
+            logger.debug("%s contains entries: %s", filename, names)
+
+            # Build an ordered list of XML entries to try: preferred names first,
+            # then any remaining .xml files in the archive.
+            xml_entries = []
+            for preferred in _PREFERRED_XML_FILES:
+                matches = [n for n in names if n.lower().endswith("/" + preferred) or n.lower() == preferred]
+                xml_entries.extend(matches)
+            # Add all other .xml files not already in the list.
+            for name in names:
+                if name.lower().endswith(".xml") and name not in xml_entries:
+                    xml_entries.append(name)
+
+            if not xml_entries:
+                logger.warning("%s: no XML entries found inside archive.", filename)
+                base_result["error"] = "No XML content found in archive"
+                return True
+
+            parsed = None
+            for entry in xml_entries:
+                try:
+                    xml_bytes = zf.read(entry)
+                    parsed = _parse_xml_for_scores(xml_bytes)
+                    logger.debug("%s/%s parsed OK", filename, entry)
+                    # If we found both score and max_score we can stop here.
+                    if parsed.get("score") and parsed.get("max_score"):
+                        break
+                except ET.ParseError as exc:
+                    logger.debug("%s/%s is not valid XML: %s", filename, entry, exc)
+                    continue
+
+            if parsed is None:
+                logger.warning("%s: could not parse any XML entries.", filename)
+                base_result["error"] = "Could not parse XML content"
+                return True
+
+            _apply_parsed_scores(base_result, parsed, filename)
+            return True
+
+    except zipfile.BadZipFile:
+        return False
+
+
+def _parse_encrypted_pka(filepath, filename, base_result):
+    """Try to decrypt *filepath* as an encrypted PKA and extract scores.
+
+    Returns ``True`` if decryption succeeded, ``False`` otherwise.
+    """
+    try:
+        with open(filepath, "rb") as fh:
+            raw = fh.read()
+
+        xml_bytes = decrypt_pka(raw)
+        logger.debug("%s: decrypted encrypted PKA (%d bytes of XML).",
+                     filename, len(xml_bytes))
+
+        # Encrypted PKA XML may contain binary data in attribute values
+        # (e.g. hashed passwords) that include control characters illegal in
+        # XML 1.0.  Decode as latin-1 (lossless for all byte values) and
+        # strip those characters so the XML parser can handle the document.
+        xml_text = xml_bytes.decode("latin-1")
+        xml_text = _ILLEGAL_XML_RE.sub("", xml_text)
+        xml_bytes = xml_text.encode("utf-8")
+
+        try:
+            parsed = _parse_xml_for_scores(xml_bytes)
+        except ET.ParseError as exc:
+            logger.warning("%s: decrypted content is not valid XML: %s", filename, exc)
+            base_result["error"] = "Decrypted content is not valid XML"
+            return True
+
+        _apply_parsed_scores(base_result, parsed, filename)
+        return True
+
+    except (ValueError, OSError) as exc:
+        logger.debug("%s: encrypted-PKA decryption failed: %s", filename, exc)
+        return False
+
+
 def parse_pka_file(filepath):
     """Extract scoring data from a single `.pka` file.
 
-    A `.pka` file is a ZIP archive containing one or more XML files.  This
-    function opens the archive, searches for the XML file most likely to contain
-    scoring data, parses it, and returns the extracted values.
+    A `.pka` file is either a ZIP archive containing XML, or an encrypted
+    Packet Tracer file that decrypts to XML.  This function tries both
+    strategies and returns the extracted values.
 
     Args:
         filepath: Path (str) to the `.pka` file.
@@ -216,82 +410,19 @@ def parse_pka_file(filepath):
     }
 
     try:
-        with _open_pka_as_zip(filepath) as zf:
-            names = zf.namelist()
-            logger.debug("%s contains entries: %s", filename, names)
-
-            # Build an ordered list of XML entries to try: preferred names first,
-            # then any remaining .xml files in the archive.
-            xml_entries = []
-            for preferred in _PREFERRED_XML_FILES:
-                matches = [n for n in names if n.lower().endswith("/" + preferred) or n.lower() == preferred]
-                xml_entries.extend(matches)
-            # Add all other .xml files not already in the list.
-            for name in names:
-                if name.lower().endswith(".xml") and name not in xml_entries:
-                    xml_entries.append(name)
-
-            if not xml_entries:
-                logger.warning("%s: no XML entries found inside archive.", filename)
-                base_result["error"] = "No XML content found in archive"
-                return base_result
-
-            parsed = None
-            for entry in xml_entries:
-                try:
-                    xml_bytes = zf.read(entry)
-                    parsed = _parse_xml_for_scores(xml_bytes)
-                    logger.debug("%s/%s parsed OK", filename, entry)
-                    # If we found both score and max_score we can stop here.
-                    if parsed.get("score") and parsed.get("max_score"):
-                        break
-                except ET.ParseError as exc:
-                    logger.debug("%s/%s is not valid XML: %s", filename, entry, exc)
-                    continue
-
-            if parsed is None:
-                logger.warning("%s: could not parse any XML entries.", filename)
-                base_result["error"] = "Could not parse XML content"
-                return base_result
-
-            score_str = parsed.get("score")
-            max_str = parsed.get("max_score")
-            profile = parsed.get("user_profile_name") or "N/A"
-
-            base_result["user_profile_name"] = profile
-
-            # Calculate percentage.
-            if score_str and max_str:
-                try:
-                    score_val = float(score_str)
-                    max_val = float(max_str)
-                    if max_val > 0:
-                        pct = (score_val / max_val) * 100.0
-                        base_result["score"] = score_str
-                        base_result["max_score"] = max_str
-                        base_result["percentage"] = f"{pct:.1f}%"
-                    else:
-                        base_result["score"] = score_str
-                        base_result["max_score"] = max_str
-                        base_result["percentage"] = "N/A"
-                except ValueError:
-                    logger.warning("%s: non-numeric score/max_score values ('%s'/'%s').",
-                                   filename, score_str, max_str)
-                    base_result["score"] = score_str
-                    base_result["max_score"] = max_str
-            elif "_percentage_raw" in parsed and parsed["_percentage_raw"]:
-                # We only have a raw percentage; store it directly.
-                base_result["percentage"] = parsed["_percentage_raw"] + "%"
-            else:
-                logger.warning("%s: scoring data not found in XML.", filename)
-                base_result["error"] = "Scoring data not found"
-
+        # Strategy 1: try opening as a ZIP archive (standard or header-prefixed).
+        if _parse_zip_pka(filepath, filename, base_result):
             return base_result
 
-    except zipfile.BadZipFile:
-        logger.warning("%s: not a valid ZIP/PKA archive.", filename)
-        base_result["error"] = "Not a valid ZIP archive"
+        # Strategy 2: try decrypting as an encrypted PKA file.
+        if _parse_encrypted_pka(filepath, filename, base_result):
+            return base_result
+
+        # Neither strategy worked.
+        logger.warning("%s: not a valid ZIP or encrypted PKA archive.", filename)
+        base_result["error"] = "Not a valid ZIP or encrypted PKA archive"
         return base_result
+
     except Exception as exc:  # pylint: disable=broad-except
         logger.warning("%s: unexpected error: %s", filename, exc)
         base_result["error"] = str(exc)
