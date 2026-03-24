@@ -446,6 +446,14 @@ class TestDifferentStudentScores:
         pcts = [results[p]["percentage"] for p in [_SAMPLE_87, _SAMPLE_97, _SAMPLE_99]]
         assert len(set(pcts)) == 3, f"Expected 3 different percentages, got {pcts}"
 
+        # Verify percentages are in the expected range for each file.
+        pct87 = float(results[_SAMPLE_87]["percentage"].rstrip("%"))
+        pct97 = float(results[_SAMPLE_97]["percentage"].rstrip("%"))
+        pct99 = float(results[_SAMPLE_99]["percentage"].rstrip("%"))
+        assert 80.0 <= pct87 <= 92.0, f"87.pka: expected ~87%, got {pct87}%"
+        assert 93.0 <= pct97 <= 100.0, f"97.pka: expected ~97%, got {pct97}%"
+        assert 97.0 <= pct99 <= 100.0, f"99.pka: expected ~99%, got {pct99}%"
+
     def test_score_ordering(self):
         """87.pka < 97.pka < 99.pka in score percentage."""
         r87 = parse_pka_file(_SAMPLE_87)

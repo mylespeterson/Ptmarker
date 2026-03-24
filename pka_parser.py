@@ -301,28 +301,25 @@ def _parse_xml_for_scores(xml_bytes):
     # scoring method compares the student's device running-configs against
     # the answer-key configs.  The COMPARISONS tree is a static template that
     # does not reflect student-specific results, so config comparison takes
-    # priority.
-    if result["score"] is None or result["max_score"] is None:
+    # priority.  Both score and max_score are set together to keep them
+    # consistent.
+    if result["score"] is None and result["max_score"] is None:
         config_result = _score_by_config_comparison(root)
         if config_result is not None:
             earned, total = config_result
-            if result["score"] is None:
-                result["score"] = str(earned)
-            if result["max_score"] is None:
-                result["max_score"] = str(total)
+            result["score"] = str(earned)
+            result["max_score"] = str(total)
 
     # --- COMPARISONS tree fallback (Packet Tracer 7.x+ encrypted format) ---
     # If config comparison is not available (e.g. fewer than three
     # PACKETTRACER5 elements), fall back to the COMPARISONS verification tree.
-    if result["score"] is None or result["max_score"] is None:
+    if result["score"] is None and result["max_score"] is None:
         comparisons = root.find(".//COMPARISONS")
         if comparisons is not None:
             earned, total = _tally_comparison_points(comparisons)
             if total > 0:
-                if result["score"] is None:
-                    result["score"] = str(earned)
-                if result["max_score"] is None:
-                    result["max_score"] = str(total)
+                result["score"] = str(earned)
+                result["max_score"] = str(total)
 
     # --- User Profile Name ---
     profile_text = _find_text(root, _PROFILE_TAGS)
