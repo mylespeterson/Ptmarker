@@ -155,6 +155,79 @@ def _tally_comparison_points(comparisons_el):
     return earned, total
 
 
+def _get_device_configs(pt5_element):
+    """Extract running-config lines for every device inside a ``<PACKETTRACER5>`` element.
+
+    Args:
+        pt5_element: An :class:`~xml.etree.ElementTree.Element` for a
+            ``<PACKETTRACER5>`` tag.
+
+    Returns:
+        A dict mapping device name (str) to a list of stripped config-line
+        strings.
+    """
+    configs = {}
+    for device in pt5_element.findall(".//DEVICE"):
+        engine = device.find("ENGINE")
+        if engine is None:
+            continue
+        name_el = engine.find("NAME")
+        if name_el is None or not name_el.text:
+            continue
+        rc = engine.find("RUNNINGCONFIG")
+        if rc is not None:
+            lines = []
+            for line_el in rc.findall("LINE"):
+                if line_el.text:
+                    lines.append(line_el.text.strip())
+            configs[name_el.text] = lines
+    return configs
+
+
+def _score_by_config_comparison(root):
+    """Compare student and answer running-configs to compute the score.
+
+    Encrypted PKA files with three ``<PACKETTRACER5>`` elements store:
+
+    * ``PT5[0]`` — the student's current network state,
+    * ``PT5[1]`` — the initial (starter) network state,
+    * ``PT5[2]`` — the answer-key network state.
+
+    This function extracts the running-config from every device in the
+    student and answer networks and counts matching significant lines.
+
+    Args:
+        root: The parsed XML root element.
+
+    Returns:
+        A tuple ``(earned, total)`` of integers, or ``None`` if the
+        comparison cannot be performed (e.g. fewer than three
+        ``PACKETTRACER5`` elements or no configs found).
+    """
+    pt5_elements = root.findall("PACKETTRACER5")
+    if len(pt5_elements) < 3:
+        return None
+
+    student_configs = _get_device_configs(pt5_elements[0])
+    answer_configs = _get_device_configs(pt5_elements[2])
+
+    if not answer_configs:
+        return None
+
+    total = 0
+    earned = 0
+    for device_name, answer_lines in answer_configs.items():
+        student_lines = student_configs.get(device_name, [])
+        student_set = set(student_lines)
+        for line in answer_lines:
+            if line and line != "!":
+                total += 1
+                if line in student_set:
+                    earned += 1
+
+    return (earned, total) if total > 0 else None
+
+
 def _parse_xml_for_scores(xml_bytes):
     """Parse XML bytes and attempt to extract score, max_score, and user_profile_name.
 
@@ -222,11 +295,25 @@ def _parse_xml_for_scores(xml_bytes):
             # separate score/max values.
             result["_percentage_raw"] = pct_text.rstrip("%").strip()
 
+    # --- Running-config comparison (Packet Tracer 7.x+ encrypted format) ---
+    # Encrypted PKA files typically contain three <PACKETTRACER5> elements:
+    # [0] student work, [1] initial state, [2] answer key.  The most accurate
+    # scoring method compares the student's device running-configs against
+    # the answer-key configs.  The COMPARISONS tree is a static template that
+    # does not reflect student-specific results, so config comparison takes
+    # priority.
+    if result["score"] is None or result["max_score"] is None:
+        config_result = _score_by_config_comparison(root)
+        if config_result is not None:
+            earned, total = config_result
+            if result["score"] is None:
+                result["score"] = str(earned)
+            if result["max_score"] is None:
+                result["max_score"] = str(total)
+
     # --- COMPARISONS tree fallback (Packet Tracer 7.x+ encrypted format) ---
-    # In newer PKA files the scoring is stored as a tree of verification nodes
-    # under <COMPARISONS>.  Each leaf <NODE> has a <POINTS> element with a
-    # value of 0 (failed) or 1 (passed).  We sum the leaf values to derive
-    # the score and count all leaves for the max.
+    # If config comparison is not available (e.g. fewer than three
+    # PACKETTRACER5 elements), fall back to the COMPARISONS verification tree.
     if result["score"] is None or result["max_score"] is None:
         comparisons = root.find(".//COMPARISONS")
         if comparisons is not None:
@@ -241,6 +328,17 @@ def _parse_xml_for_scores(xml_bytes):
     profile_text = _find_text(root, _PROFILE_TAGS)
     if profile_text is None:
         profile_text = _find_attr(root, _PROFILE_TAGS, ("name", "value", "val"))
+    # In encrypted PKA files, the student's name is often stored in a
+    # <USER_PROFILE><NAME>…</NAME></USER_PROFILE> element inside the first
+    # (student) PACKETTRACER5 block.  Prefer a non-"Guest" name.
+    if profile_text is None:
+        for up in root.iter("USER_PROFILE"):
+            name_el = up.find("NAME")
+            if name_el is not None and name_el.text:
+                candidate = name_el.text.strip()
+                if candidate and candidate != "Guest":
+                    profile_text = candidate
+                    break
     result["user_profile_name"] = profile_text
 
     return result
