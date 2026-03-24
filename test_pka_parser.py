@@ -636,7 +636,7 @@ class TestMidtermStudentScores:
             _SAMPLE_KEATEN: (50, "Keaten Reuben"),
             _SAMPLE_CHHAVI: (85, "Chhavi"),
         }
-        tolerance = 10  # allow ±10 percentage points
+        tolerance = 7  # allow ±7 percentage points
 
         for path, (exp_pct, exp_name) in expected.items():
             result = parse_pka_file(path)
