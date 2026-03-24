@@ -193,8 +193,12 @@ def _score_by_config_comparison(root):
     * ``PT5[1]`` — the initial (starter) network state,
     * ``PT5[2]`` — the answer-key network state.
 
-    This function extracts the running-config from every device in the
-    student and answer networks and counts matching significant lines.
+    Scoring counts only the config lines that the student needed to *add*
+    relative to the initial state.  Lines already present in the starter
+    network are not counted because they do not represent student work.
+    Multiplicity is preserved using :class:`collections.Counter` so that
+    duplicate lines (e.g. ``shutdown`` on multiple interfaces) are scored
+    individually.
 
     Args:
         root: The parsed XML root element.
@@ -204,11 +208,14 @@ def _score_by_config_comparison(root):
         comparison cannot be performed (e.g. fewer than three
         ``PACKETTRACER5`` elements or no configs found).
     """
+    from collections import Counter
+
     pt5_elements = root.findall("PACKETTRACER5")
     if len(pt5_elements) < 3:
         return None
 
     student_configs = _get_device_configs(pt5_elements[0])
+    initial_configs = _get_device_configs(pt5_elements[1])
     answer_configs = _get_device_configs(pt5_elements[2])
 
     if not answer_configs:
@@ -217,13 +224,19 @@ def _score_by_config_comparison(root):
     total = 0
     earned = 0
     for device_name, answer_lines in answer_configs.items():
-        student_lines = student_configs.get(device_name, [])
-        student_set = set(student_lines)
-        for line in answer_lines:
-            if line and line != "!":
-                total += 1
-                if line in student_set:
-                    earned += 1
+        sig_answer = [l for l in answer_lines if l and l != "!"]
+        sig_initial = [l for l in initial_configs.get(device_name, [])
+                       if l and l != "!"]
+        sig_student = [l for l in student_configs.get(device_name, [])
+                       if l and l != "!"]
+
+        # Lines the student needed to add (answer minus initial).
+        required = Counter(sig_answer) - Counter(sig_initial)
+        # Lines the student actually has that match required items.
+        matched = required & Counter(sig_student)
+
+        total += sum(required.values())
+        earned += sum(matched.values())
 
     return (earned, total) if total > 0 else None
 

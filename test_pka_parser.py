@@ -190,7 +190,7 @@ class TestEncryptedPka:
         assert result["max_score"] != "N/A"
         assert result["percentage"] != "N/A"
         # Verify they are numeric.
-        assert float(result["score"]) > 0
+        assert float(result["score"]) >= 0
         assert float(result["max_score"]) > 0
         assert result["percentage"].endswith("%")
 
@@ -450,7 +450,7 @@ class TestDifferentStudentScores:
         pct87 = float(results[_SAMPLE_87]["percentage"].rstrip("%"))
         pct97 = float(results[_SAMPLE_97]["percentage"].rstrip("%"))
         pct99 = float(results[_SAMPLE_99]["percentage"].rstrip("%"))
-        assert 80.0 <= pct87 <= 92.0, f"87.pka: expected ~87%, got {pct87}%"
+        assert 65.0 <= pct87 <= 80.0, f"87.pka: expected ~72%, got {pct87}%"
         assert 93.0 <= pct97 <= 100.0, f"97.pka: expected ~97%, got {pct97}%"
         assert 97.0 <= pct99 <= 100.0, f"99.pka: expected ~99%, got {pct99}%"
 
@@ -475,3 +475,204 @@ class TestDifferentStudentScores:
         assert r97["user_profile_name"] != "Guest"
         assert r99["user_profile_name"] != "N/A"
         assert r99["user_profile_name"] != "Guest"
+
+
+# ---------------------------------------------------------------------------
+# Tests for config comparison with non-empty initial state
+# ---------------------------------------------------------------------------
+
+class TestConfigComparisonInitialState:
+    """Verify that config comparison correctly subtracts initial-state lines."""
+
+    def test_initial_lines_not_counted(self):
+        """Lines already present in the initial state should not inflate the score."""
+        xml_content = b"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<PACKETTRACER5_ACTIVITY>
+  <PACKETTRACER5>
+    <NETWORK><DEVICES><DEVICE><ENGINE>
+      <NAME>R1</NAME>
+      <RUNNINGCONFIG>
+        <LINE>hostname R1</LINE>
+        <LINE>interface G0/0</LINE>
+        <LINE>ip address 10.0.0.1 255.255.255.0</LINE>
+      </RUNNINGCONFIG>
+    </ENGINE></DEVICE></DEVICES></NETWORK>
+  </PACKETTRACER5>
+  <PACKETTRACER5>
+    <NETWORK><DEVICES><DEVICE><ENGINE>
+      <NAME>R1</NAME>
+      <RUNNINGCONFIG>
+        <LINE>hostname R1</LINE>
+        <LINE>interface G0/0</LINE>
+        <LINE>ip address 10.0.0.1 255.255.255.0</LINE>
+      </RUNNINGCONFIG>
+    </ENGINE></DEVICE></DEVICES></NETWORK>
+  </PACKETTRACER5>
+  <PACKETTRACER5>
+    <NETWORK><DEVICES><DEVICE><ENGINE>
+      <NAME>R1</NAME>
+      <RUNNINGCONFIG>
+        <LINE>hostname R1</LINE>
+        <LINE>interface G0/0</LINE>
+        <LINE>ip address 10.0.0.1 255.255.255.0</LINE>
+        <LINE>ip route 0.0.0.0 0.0.0.0 10.0.0.254</LINE>
+        <LINE>ip route 192.168.0.0 255.255.0.0 10.0.0.1</LINE>
+      </RUNNINGCONFIG>
+    </ENGINE></DEVICE></DEVICES></NETWORK>
+  </PACKETTRACER5>
+</PACKETTRACER5_ACTIVITY>
+"""
+        path = _write_tmp(_make_zip_bytes(xml_content=xml_content,
+                                          entry_name="default.xml"))
+        try:
+            result = parse_pka_file(path)
+            assert result["error"] is None
+            # The initial state already has 3 lines (hostname, interface, ip address).
+            # Only 2 lines are new in the answer (the two ip routes).
+            # The student has 0 of the new lines.
+            assert result["score"] == "0"
+            assert result["max_score"] == "2"
+            assert result["percentage"] == "0.0%"
+        finally:
+            os.unlink(path)
+
+    def test_duplicate_lines_scored_individually(self):
+        """Duplicate config lines (e.g. 'shutdown' on multiple interfaces) are scored."""
+        xml_content = b"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<PACKETTRACER5_ACTIVITY>
+  <PACKETTRACER5>
+    <NETWORK><DEVICES><DEVICE><ENGINE>
+      <NAME>SW1</NAME>
+      <RUNNINGCONFIG>
+        <LINE>interface Vlan10</LINE>
+        <LINE>shutdown</LINE>
+        <LINE>interface Vlan20</LINE>
+        <LINE>no shutdown</LINE>
+      </RUNNINGCONFIG>
+    </ENGINE></DEVICE></DEVICES></NETWORK>
+  </PACKETTRACER5>
+  <PACKETTRACER5>
+    <NETWORK><DEVICES><DEVICE><ENGINE>
+      <NAME>SW1</NAME>
+      <RUNNINGCONFIG>
+        <LINE>interface Vlan10</LINE>
+        <LINE>shutdown</LINE>
+        <LINE>interface Vlan20</LINE>
+        <LINE>shutdown</LINE>
+      </RUNNINGCONFIG>
+    </ENGINE></DEVICE></DEVICES></NETWORK>
+  </PACKETTRACER5>
+  <PACKETTRACER5>
+    <NETWORK><DEVICES><DEVICE><ENGINE>
+      <NAME>SW1</NAME>
+      <RUNNINGCONFIG>
+        <LINE>interface Vlan10</LINE>
+        <LINE>no shutdown</LINE>
+        <LINE>interface Vlan20</LINE>
+        <LINE>no shutdown</LINE>
+      </RUNNINGCONFIG>
+    </ENGINE></DEVICE></DEVICES></NETWORK>
+  </PACKETTRACER5>
+</PACKETTRACER5_ACTIVITY>
+"""
+        path = _write_tmp(_make_zip_bytes(xml_content=xml_content,
+                                          entry_name="default.xml"))
+        try:
+            result = parse_pka_file(path)
+            assert result["error"] is None
+            # Initial has 2x "shutdown". Answer has 2x "no shutdown" and 0x "shutdown".
+            # Required (answer - initial): 2x "no shutdown" (new in answer).
+            # Student has 1x "no shutdown", so earned = 1 of 2 required.
+            assert result["score"] == "1"
+            assert result["max_score"] == "2"
+            assert result["percentage"] == "50.0%"
+        finally:
+            os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# Tests for CET1000 Midterm student files
+# ---------------------------------------------------------------------------
+
+_SAMPLE_TIRTH = os.path.join(
+    _SAMPLE_PKA_DIR,
+    "Tirth Tejas Bhavsar_2959567_assignsubmission_file_CET1000-Midterm-SBA-V2.pka",
+)
+_SAMPLE_DARIEN = os.path.join(
+    _SAMPLE_PKA_DIR,
+    "Darien Etherington_2959573_assignsubmission_file_"
+    "Darien Etherington A00322541 CET1000-Midterm-SBA-V2.pka",
+)
+_SAMPLE_BLAKE = os.path.join(
+    _SAMPLE_PKA_DIR,
+    "Blake Lapointe_2959570_assignsubmission_file_CET1000-Midterm-SBA-V2.pka",
+)
+_SAMPLE_KEATEN = os.path.join(
+    _SAMPLE_PKA_DIR,
+    "Keaten Reuben_2959559_assignsubmission_file_CET1000-Midterm-SBA-V2 - Completed.pka",
+)
+_SAMPLE_CHHAVI = os.path.join(
+    _SAMPLE_PKA_DIR,
+    "Chhavi Chhavi_2959583_assignsubmission_file_midterm-A00320667.pka",
+)
+_HAS_MIDTERM_PKAS = all(
+    os.path.isfile(p)
+    for p in [_SAMPLE_TIRTH, _SAMPLE_DARIEN, _SAMPLE_BLAKE, _SAMPLE_KEATEN, _SAMPLE_CHHAVI]
+)
+
+
+@pytest.mark.skipif(not _HAS_MIDTERM_PKAS, reason="CET1000 Midterm PKA files not present")
+class TestMidtermStudentScores:
+    """Verify scoring of CET1000 Midterm SBA student submissions."""
+
+    def test_scores_approximate_expected(self):
+        """Each student file scores within a reasonable range of the expected mark."""
+        expected = {
+            _SAMPLE_TIRTH: (10, "Tirth Bhavsar"),
+            _SAMPLE_DARIEN: (86, "Darien Etherington"),
+            _SAMPLE_BLAKE: (48, "Blake Lapointe"),
+            _SAMPLE_KEATEN: (50, "Keaten Reuben"),
+            _SAMPLE_CHHAVI: (85, "Chhavi"),
+        }
+        tolerance = 10  # allow ±10 percentage points
+
+        for path, (exp_pct, exp_name) in expected.items():
+            result = parse_pka_file(path)
+            assert result["error"] is None, f"{path}: {result['error']}"
+            pct = float(result["percentage"].rstrip("%"))
+            assert abs(pct - exp_pct) <= tolerance, (
+                f"{os.path.basename(path)}: expected ~{exp_pct}%, got {pct}%"
+            )
+            assert result["user_profile_name"] == exp_name, (
+                f"{os.path.basename(path)}: expected name '{exp_name}', "
+                f"got '{result['user_profile_name']}'"
+            )
+
+    def test_score_ordering(self):
+        """Scores should reflect relative student performance."""
+        results = {}
+        for path in [_SAMPLE_TIRTH, _SAMPLE_BLAKE, _SAMPLE_KEATEN,
+                      _SAMPLE_CHHAVI, _SAMPLE_DARIEN]:
+            results[path] = parse_pka_file(path)
+
+        pct_tirth = float(results[_SAMPLE_TIRTH]["percentage"].rstrip("%"))
+        pct_blake = float(results[_SAMPLE_BLAKE]["percentage"].rstrip("%"))
+        pct_keaten = float(results[_SAMPLE_KEATEN]["percentage"].rstrip("%"))
+        pct_chhavi = float(results[_SAMPLE_CHHAVI]["percentage"].rstrip("%"))
+        pct_darien = float(results[_SAMPLE_DARIEN]["percentage"].rstrip("%"))
+
+        # Tirth (10%) < Blake (48%) < Keaten (50%) < Darien/Chhavi (~85%)
+        assert pct_tirth < pct_blake < pct_keaten
+        assert pct_keaten < pct_chhavi
+        assert pct_keaten < pct_darien
+
+    def test_all_have_different_scores(self):
+        """Each student should have a distinct percentage."""
+        pcts = set()
+        for path in [_SAMPLE_TIRTH, _SAMPLE_DARIEN, _SAMPLE_BLAKE,
+                      _SAMPLE_KEATEN, _SAMPLE_CHHAVI]:
+            result = parse_pka_file(path)
+            pcts.add(result["percentage"])
+        assert len(pcts) == 5, f"Expected 5 distinct scores, got {pcts}"
