@@ -58,9 +58,7 @@ def _open_pka_as_zip(filepath):
         raw = fh.read()
 
     offset = raw.find(_ZIP_SIGNATURE)
-    if offset <= 0:
-        # offset == 0 means the direct open should have worked; -1 means no
-        # ZIP data at all.  Either way, raise the canonical error.
+    if offset < 0:
         raise zipfile.BadZipFile("Not a valid ZIP/PKA archive")
 
     logger.debug("Found ZIP signature at byte offset %d in %s", offset, filepath)
