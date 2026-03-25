@@ -673,7 +673,8 @@ def _evaluate_ct2_item(item, config_lines, config_set, sections,
 
     # Unrecognised property — return None so the caller can detect it and
     # fall back to a different scoring strategy.
-    logger.debug("Unknown checkType=2 property: id=%s path=%s", item_id, path)
+    logger.debug("Unknown checkType=2 property: id=%s path=%s device=%s",
+                 item_id, path, item.get("device", "?"))
     return None
 
 
