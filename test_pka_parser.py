@@ -13,6 +13,7 @@ import pytest
 from pka_parser import (
     _open_pka_as_zip,
     _score_by_config_comparison,
+    _score_by_property_evaluation,
     _tally_comparison_points,
     parse_pka_file,
 )
@@ -627,8 +628,8 @@ _HAS_MIDTERM_PKAS = all(
 class TestMidtermStudentScores:
     """Verify scoring of CET1000 Midterm SBA student submissions."""
 
-    def test_scores_approximate_expected(self):
-        """Each student file scores within a reasonable range of the expected mark."""
+    def test_scores_exact(self):
+        """Each student file scores exactly the expected mark."""
         expected = {
             _SAMPLE_TIRTH: (10, "Tirth Bhavsar"),
             _SAMPLE_DARIEN: (86, "Darien Etherington"),
@@ -636,14 +637,24 @@ class TestMidtermStudentScores:
             _SAMPLE_KEATEN: (50, "Keaten Reuben"),
             _SAMPLE_CHHAVI: (85, "Chhavi"),
         }
-        tolerance = 7  # allow ±7 percentage points
 
-        for path, (exp_pct, exp_name) in expected.items():
+        for path, (exp_score, exp_name) in expected.items():
             result = parse_pka_file(path)
             assert result["error"] is None, f"{path}: {result['error']}"
+            score = int(result["score"])
+            max_score = int(result["max_score"])
+            assert max_score == 100, (
+                f"{os.path.basename(path)}: expected max_score=100, "
+                f"got {max_score}"
+            )
+            assert score == exp_score, (
+                f"{os.path.basename(path)}: expected {exp_score}/100, "
+                f"got {score}/100"
+            )
             pct = float(result["percentage"].rstrip("%"))
-            assert abs(pct - exp_pct) <= tolerance, (
-                f"{os.path.basename(path)}: expected ~{exp_pct}%, got {pct}%"
+            assert pct == float(exp_score), (
+                f"{os.path.basename(path)}: expected {exp_score}.0%, "
+                f"got {pct}%"
             )
             assert result["user_profile_name"] == exp_name, (
                 f"{os.path.basename(path)}: expected name '{exp_name}', "

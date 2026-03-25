@@ -200,6 +200,10 @@ def _score_by_config_comparison(root):
     duplicate lines (e.g. ``shutdown`` on multiple interfaces) are scored
     individually.
 
+    This is a broad heuristic used as a fallback when property-level
+    evaluation is not available (e.g. the COMPARISONS tree has no
+    ``checkType="2"`` assessment items).
+
     Args:
         root: The parsed XML root element.
 
@@ -239,6 +243,484 @@ def _score_by_config_comparison(root):
         earned += sum(matched.values())
 
     return (earned, total) if total > 0 else None
+
+
+def _score_by_property_evaluation(root):
+    """Evaluate student work against the COMPARISONS marking-tree properties.
+
+    Encrypted PKA files with three ``<PACKETTRACER5>`` elements store:
+
+    * ``PT5[0]`` — the student's current network state,
+    * ``PT5[1]`` — the initial (starter) network state,
+    * ``PT5[2]`` — the answer-key network state.
+
+    The ``<COMPARISONS>`` tree contains ``checkType="2"`` leaf nodes that
+    represent instructor-graded assessment items.  Each item specifies a
+    device property (e.g. SSH Version, Enable Secret) with an expected
+    ``nodeValue``.  This function evaluates each item against the student's
+    running-config and structured device data to produce an exact score.
+
+    Args:
+        root: The parsed XML root element.
+
+    Returns:
+        A tuple ``(earned, total)`` of integers, or ``None`` if the
+        evaluation cannot be performed.
+    """
+    comparisons = root.find(".//COMPARISONS")
+    if comparisons is None:
+        return None
+
+    pt5_elements = root.findall("PACKETTRACER5")
+    if len(pt5_elements) < 1:
+        return None
+
+    ct2_items = _extract_ct2_items(comparisons)
+    if not ct2_items:
+        return None
+
+    student_configs = _get_device_configs(pt5_elements[0])
+
+    earned = 0
+    unsupported = 0
+    for item in ct2_items:
+        dev = item["device"]
+        config_lines = student_configs.get(dev, [])
+        config_set = set(l.strip() for l in config_lines if l)
+        sections = _parse_config_sections(config_lines)
+        engine = _find_device_engine(pt5_elements[0], dev)
+
+        result = _evaluate_ct2_item(item, config_lines, config_set, sections,
+                                    engine)
+        if result is None:
+            unsupported += 1
+        elif result:
+            earned += 1
+
+    # If any items use property types we don't recognise, abort so the
+    # caller can fall back to a less precise scoring strategy.
+    if unsupported > 0:
+        logger.debug(
+            "Property evaluation aborted: %d/%d items use unsupported "
+            "property types", unsupported, len(ct2_items))
+        return None
+
+    return (earned, len(ct2_items))
+
+
+def _extract_ct2_items(comparisons_el):
+    """Extract all ``checkType="2"`` leaf items from a COMPARISONS tree.
+
+    Returns a list of dicts, each with keys ``name``, ``id``,
+    ``nodeValue``, ``device``, ``path``, and ``path_ids``.
+    """
+    items = []
+
+    def _walk(node, ancestors=()):
+        name_el = node.find("NAME")
+        if name_el is None:
+            return
+        name = (name_el.text or "").strip()
+        check_type = name_el.get("checkType", "")
+        node_value = name_el.get("nodeValue", "")
+        id_el = node.find("ID")
+        item_id = (id_el.text.strip()
+                   if id_el is not None and id_el.text else "")
+        pts_el = node.find("POINTS")
+        pts = (pts_el.text.strip()
+               if pts_el is not None and pts_el.text else "")
+        children = node.findall("NODE")
+        current = ancestors + ((name, item_id),)
+
+        if check_type == "2" and pts == "1" and not children:
+            items.append({
+                "name": name,
+                "id": item_id,
+                "nodeValue": node_value,
+                "device": current[1][0] if len(current) > 1 else "",
+                "path": [a[0] for a in current[2:]],
+                "path_ids": [a[1] for a in current[2:]],
+            })
+        for child in children:
+            _walk(child, current)
+
+    for top_node in comparisons_el.findall("NODE"):
+        _walk(top_node)
+    return items
+
+
+def _find_device_engine(pt5_el, device_name):
+    """Locate and return the ENGINE element for *device_name*."""
+    for device in pt5_el.findall(".//DEVICE"):
+        engine = device.find("ENGINE")
+        if engine is None:
+            continue
+        name_el = engine.find("NAME")
+        if (name_el is not None and name_el.text
+                and name_el.text.strip() == device_name):
+            return engine
+    return None
+
+
+# ---- Running-config section parser ------------------------------------------
+
+_SECTION_PREFIXES = (
+    "line ", "interface ", "router ", "ip access-list ",
+    "zone ", "zone-pair ", "class-map ", "policy-map ",
+    "radius ", "crypto ", "aaa ",
+)
+
+
+def _parse_config_sections(config_lines):
+    """Parse running-config lines into hierarchical sections.
+
+    Returns a dict with:
+
+    * ``con_lines``   — sub-commands under ``line con 0``
+    * ``vty_ranges``  — list of ``(start, end, [lines])`` for VTY ranges
+    * ``interfaces``  — dict mapping interface name → sub-command list
+    * ``sections``    — dict mapping section header → sub-command list
+    """
+    result = {
+        "con_lines": [],
+        "vty_ranges": [],
+        "interfaces": {},
+        "sections": {},
+    }
+    current_section = None
+    current_lines = []  # type: list[str]
+
+    def _close(sec, lines):
+        if sec is None:
+            return
+        result["sections"][sec] = lines
+        if sec.startswith("line vty "):
+            parts = sec.split()
+            if len(parts) >= 4:
+                try:
+                    result["vty_ranges"].append(
+                        (int(parts[2]), int(parts[3]), lines))
+                except ValueError:
+                    pass
+        elif sec.startswith("line con"):
+            result["con_lines"] = lines
+        elif sec.startswith("interface "):
+            result["interfaces"][sec[len("interface "):]] = lines
+
+    for line in config_lines:
+        stripped = line.strip()
+        if not stripped or stripped == "!":
+            if current_section:
+                _close(current_section, current_lines)
+                current_section = None
+                current_lines = []
+            continue
+
+        is_header = any(stripped.startswith(p) for p in _SECTION_PREFIXES)
+        if is_header:
+            _close(current_section, current_lines)
+            current_section = stripped
+            current_lines = []
+        elif current_section:
+            current_lines.append(stripped)
+
+    _close(current_section, current_lines)
+    return result
+
+
+def _get_vty_section_lines(sections, vty_num):
+    """Return the sub-command list for the VTY range containing *vty_num*."""
+    for start, end, lines in sections["vty_ranges"]:
+        if start <= vty_num <= end:
+            return lines
+    return []
+
+
+# ---- Individual property evaluators -----------------------------------------
+
+def _evaluate_ct2_item(item, config_lines, config_set, sections,
+                       engine=None):
+    """Return ``True`` if the student satisfies a single checkType=2 item."""
+    nv = item["nodeValue"].strip()
+    item_id = item["id"]
+    path = item["path"]
+    path_str = " ".join(path)
+
+    # --- Global IOS properties (checked against flat config set) ----------
+
+    if item_id == "Enable Secret":
+        return f"enable secret 5 {nv}" in config_set
+
+    if item_id == "Service Password Encryption":
+        return "service password-encryption" in config_set
+
+    if item_id == "IP Domain Name":
+        return f"ip domain-name {nv}" in config_set
+
+    if item_id == "SSH Server Version":
+        return f"ip ssh version {nv}" in config_set
+
+    if item_id == "SSH Server Authentication-retries":
+        return f"ip ssh authentication-retries {nv}" in config_set
+
+    if item_id == "SSH Server Timeout":
+        return f"ip ssh time-out {nv}" in config_set
+
+    if item_id == "Security Password Min-Length":
+        return f"security passwords min-length {nv}" in config_set
+
+    if item_id == "Service timestamp log":
+        return "service timestamps log datetime msec" in config_set
+
+    # --- AAA ---------------------------------------------------------------
+
+    if item_id == "New-model" and "AAA" in path:
+        return "aaa new-model" in config_set
+
+    if ("AAA" in path and "Authentication" in path
+            and "Authen Command" in path_str):
+        return nv.strip() in config_set
+
+    # --- Login options -----------------------------------------------------
+
+    if item_id == "Login On Success":
+        return "login on-success log" in config_set
+
+    if item_id == "Login On Failure":
+        return "login on-failure log" in config_set
+
+    if item_id == "Duration" and "Blocking" in path:
+        return any(f"login block-for {nv}" in l for l in config_lines)
+
+    if item_id == "Attempts" and "Blocking" in path:
+        return any(f"attempts {nv} within" in l for l in config_lines)
+
+    if item_id == "Period" and "Blocking" in path:
+        return any(f"within {nv}" in l for l in config_lines)
+
+    # --- Security / crypto -------------------------------------------------
+
+    if item_id == "Modulus Bits":
+        if engine is not None:
+            sec_el = engine.find("SECURITY")
+            if sec_el is not None:
+                mb = sec_el.find("MODULUS_BITS")
+                if mb is not None and mb.text:
+                    return mb.text.strip() == nv
+        return False
+
+    # --- NTP ---------------------------------------------------------------
+
+    if item_id == "Address0" and "NTP" in path:
+        # NTP server address; the config line may have extra options
+        # like ``key 1`` after the address.
+        return any(l.strip().startswith(f"ntp server {nv}")
+                   for l in config_lines)
+
+    if (item_id == "Password" and "NTP" in path
+            and "Authentication Keys" in path):
+        key_num = None
+        for p in path:
+            if p.startswith("Key "):
+                key_num = p.split(" ", 1)[1]
+                break
+        if key_num:
+            return any(f"ntp authentication-key {key_num} md5" in l
+                       for l in config_lines)
+        return False
+
+    # --- SYSLOG ------------------------------------------------------------
+
+    if item_id == "Address" and "SYSLOG" in path_str:
+        return f"logging {nv}" in config_set
+
+    # --- Console / VTY line properties (section-aware) ---------------------
+
+    if item_id == "AAA Method List Name":
+        target = f"login authentication {nv}"
+        if "Console" in path_str:
+            return target in sections["con_lines"]
+        if "VTY" in path_str:
+            vn = _vty_num_from_path(path)
+            if vn is not None:
+                return target in _get_vty_section_lines(sections, vn)
+        return target in config_set
+
+    if item_id == "Transport Input":
+        if nv == "2":  # 2 → SSH
+            target = "transport input ssh"
+            if "VTY" in path_str:
+                vn = _vty_num_from_path(path)
+                if vn is not None:
+                    return target in _get_vty_section_lines(sections, vn)
+            return target in config_set
+        return False
+
+    if item_id == "Login" and ("VTY" in path_str or "Console" in path_str):
+        if nv == "2":  # 2 → login local
+            target = "login local"
+            if "Console" in path_str:
+                return target in sections["con_lines"]
+            if "VTY" in path_str:
+                vn = _vty_num_from_path(path)
+                if vn is not None:
+                    return target in _get_vty_section_lines(sections, vn)
+            return target in config_set
+        return False
+
+    # --- Usernames ---------------------------------------------------------
+
+    if "User Names" in path:
+        parts = nv.split(" ", 1)
+        if len(parts) == 2:
+            uname, secret_hash = parts
+            # Username line may include ``privilege N`` before ``secret``.
+            prefix = f"username {uname} "
+            suffix = f"secret 5 {secret_hash}"
+            for line in config_lines:
+                s = line.strip()
+                if s.startswith(prefix) and s.endswith(suffix):
+                    return True
+        return False
+
+    # --- ACLs --------------------------------------------------------------
+
+    if "ACL" in path and len(path) <= 2:
+        return nv in config_set
+
+    # --- OSPF --------------------------------------------------------------
+
+    if "OSPF" in path and "Area Authentication" in path:
+        if nv == "2":  # 2 → message-digest
+            return (f"area {item_id} authentication message-digest"
+                    in config_set)
+        return False
+
+    if "OSPF Message Digest Key" in path_str and "Ports" in path:
+        iface_name = _iface_name_from_path(path)
+        if iface_name:
+            iface_lines = sections["interfaces"].get(iface_name, [])
+            return any(f"ip ospf message-digest-key {item_id} md5" in l
+                       for l in iface_lines)
+        return any(f"ip ospf message-digest-key {item_id} md5" in l
+                   for l in config_lines)
+
+    # --- Zone-Based Firewall -----------------------------------------------
+
+    if "Zone Based Firewall" in path and "Zone Names" in path:
+        return f"zone security {nv}" in config_set
+
+    if "Zone Pairs" in path_str and item_id == "Name":
+        return any(f"zone-pair security {nv}" in l for l in config_lines)
+
+    if "Zone Pairs" in path_str and item_id == "Source Zone":
+        pair = _zone_pair_name_from_path(path)
+        if pair:
+            return any(f"zone-pair security {pair} source {nv}" in l
+                       for l in config_lines)
+        return False
+
+    if "Zone Pairs" in path_str and item_id == "Destination Zone":
+        pair = _zone_pair_name_from_path(path)
+        if pair:
+            return any(f"destination {nv}" in l and pair in l
+                       for l in config_lines)
+        return False
+
+    if "Zone Pairs" in path_str and item_id == "Service Policy":
+        return f"service-policy type inspect {nv}" in config_set
+
+    # --- Class Maps --------------------------------------------------------
+
+    if "Class Maps" in path and item_id == "Map Type":
+        cm_name = _class_map_name_from_path(path)
+        if cm_name and nv == "2":  # 2 → match-any inspect
+            return (f"class-map type inspect match-any {cm_name}"
+                    in config_set)
+        return False
+
+    if "Class Maps" in path and "Statements" in path:
+        return f"match {nv}" in config_set
+
+    # --- Policy Maps (section-aware for class/action) ----------------------
+
+    if "Policy Maps" in path and item_id == "Policy Map Name":
+        return f"policy-map type inspect {nv}" in config_set
+
+    if "Policy Maps" in path and item_id == "Policy Map Type":
+        pm_name = _policy_map_name_from_path(path)
+        if pm_name and nv == "2":  # 2 → inspect
+            return f"policy-map type inspect {pm_name}" in config_set
+        return False
+
+    if "Policy Maps" in path and item_id == "Class Map":
+        pm_name = _policy_map_name_from_path(path)
+        if pm_name:
+            pm_lines = sections["sections"].get(
+                f"policy-map type inspect {pm_name}", [])
+            return f"class type inspect {nv}" in pm_lines
+        return f"class type inspect {nv}" in config_set
+
+    if "Policy Maps" in path and item_id == "Action":
+        if nv == "2":  # 2 → inspect
+            pm_name = _policy_map_name_from_path(path)
+            if pm_name:
+                pm_lines = sections["sections"].get(
+                    f"policy-map type inspect {pm_name}", [])
+                return "inspect" in pm_lines
+            return "inspect" in config_set
+        return False
+
+    # Unrecognised property — return None so the caller can detect it and
+    # fall back to a different scoring strategy.
+    logger.debug("Unknown checkType=2 property: id=%s path=%s", item_id, path)
+    return None
+
+
+# ---- Path helpers -----------------------------------------------------------
+
+def _vty_num_from_path(path):
+    """Extract the VTY line number from a COMPARISONS path list."""
+    for p in path:
+        if p.startswith("VTY Line "):
+            try:
+                return int(p.split(" ")[-1])
+            except ValueError:
+                pass
+    return None
+
+
+def _iface_name_from_path(path):
+    """Extract the interface name from a Ports path list."""
+    for p in path:
+        if p == "Ports":
+            continue
+        if "OSPF" in p:
+            break
+        return p
+    return None
+
+
+def _zone_pair_name_from_path(path):
+    for p in path:
+        if p.startswith("Zone Pair "):
+            return p[len("Zone Pair "):]
+    return None
+
+
+def _class_map_name_from_path(path):
+    for p in path:
+        if p not in ("Class Maps", "Class Map List", "Map Type",
+                     "Statements"):
+            return p
+    return None
+
+
+def _policy_map_name_from_path(path):
+    for p in path:
+        if p.startswith("Policy Map ") and "List" not in p:
+            return p[len("Policy Map "):]
+    return None
 
 
 def _parse_xml_for_scores(xml_bytes):
@@ -308,14 +790,24 @@ def _parse_xml_for_scores(xml_bytes):
             # separate score/max values.
             result["_percentage_raw"] = pct_text.rstrip("%").strip()
 
-    # --- Running-config comparison (Packet Tracer 7.x+ encrypted format) ---
+    # --- Property evaluation (Packet Tracer 7.x+ encrypted format) ---------
     # Encrypted PKA files typically contain three <PACKETTRACER5> elements:
     # [0] student work, [1] initial state, [2] answer key.  The most accurate
-    # scoring method compares the student's device running-configs against
-    # the answer-key configs.  The COMPARISONS tree is a static template that
-    # does not reflect student-specific results, so config comparison takes
-    # priority.  Both score and max_score are set together to keep them
+    # scoring method evaluates each checkType="2" assessment item in the
+    # COMPARISONS tree against the student's running-config and device
+    # properties.  Both score and max_score are set together to keep them
     # consistent.
+    if result["score"] is None and result["max_score"] is None:
+        prop_result = _score_by_property_evaluation(root)
+        if prop_result is not None:
+            earned, total = prop_result
+            result["score"] = str(earned)
+            result["max_score"] = str(total)
+
+    # --- Running-config comparison fallback --------------------------------
+    # When the COMPARISONS tree has no checkType="2" items (or doesn't exist)
+    # but three PACKETTRACER5 elements are present, fall back to a heuristic
+    # that counts matching config lines (answer minus initial).
     if result["score"] is None and result["max_score"] is None:
         config_result = _score_by_config_comparison(root)
         if config_result is not None:
@@ -324,8 +816,8 @@ def _parse_xml_for_scores(xml_bytes):
             result["max_score"] = str(total)
 
     # --- COMPARISONS tree fallback (Packet Tracer 7.x+ encrypted format) ---
-    # If config comparison is not available (e.g. fewer than three
-    # PACKETTRACER5 elements), fall back to the COMPARISONS verification tree.
+    # If neither property evaluation nor config comparison is available,
+    # fall back to the COMPARISONS verification tree leaf-node tally.
     if result["score"] is None and result["max_score"] is None:
         comparisons = root.find(".//COMPARISONS")
         if comparisons is not None:
