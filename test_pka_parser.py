@@ -11,6 +11,7 @@ import zipfile
 import pytest
 
 from pka_parser import (
+    _evaluate_ct2_item_generic,
     _open_pka_as_zip,
     _score_by_config_comparison,
     _score_by_property_evaluation,
@@ -448,12 +449,13 @@ class TestDifferentStudentScores:
         assert len(set(pcts)) == 3, f"Expected 3 different percentages, got {pcts}"
 
         # Verify percentages are in the expected range for each file.
+        # Property evaluation produces per-item scoring (out of 149 items).
         pct87 = float(results[_SAMPLE_87]["percentage"].rstrip("%"))
         pct97 = float(results[_SAMPLE_97]["percentage"].rstrip("%"))
         pct99 = float(results[_SAMPLE_99]["percentage"].rstrip("%"))
-        assert 65.0 <= pct87 <= 80.0, f"87.pka: expected ~72%, got {pct87}%"
-        assert 93.0 <= pct97 <= 100.0, f"97.pka: expected ~97%, got {pct97}%"
-        assert 97.0 <= pct99 <= 100.0, f"99.pka: expected ~99%, got {pct99}%"
+        assert 83.0 <= pct87 <= 93.0, f"87.pka: expected ~88%, got {pct87}%"
+        assert 90.0 <= pct97 <= 100.0, f"97.pka: expected ~95%, got {pct97}%"
+        assert 97.0 <= pct99 <= 100.0, f"99.pka: expected ~100%, got {pct99}%"
 
     def test_score_ordering(self):
         """87.pka < 97.pka < 99.pka in score percentage."""
@@ -687,3 +689,194 @@ class TestMidtermStudentScores:
             result = parse_pka_file(path)
             pcts.add(result["percentage"])
         assert len(pcts) == 5, f"Expected 5 distinct scores, got {pcts}"
+
+
+# ---------------------------------------------------------------------------
+# Tests for generic answer-key comparison fallback
+# ---------------------------------------------------------------------------
+
+class TestGenericPropertyEvaluation:
+    """Verify the generic answer-key comparison fallback works correctly."""
+
+    def test_generic_matches_nodevalue_in_answer_config(self):
+        """Generic evaluator finds a nodeValue-bearing line in the student config."""
+        from pka_parser import _parse_config_sections
+        item = {
+            "nodeValue": "192.168.10.1",
+            "id": "IP Address",
+            "name": "IP Address",
+            "device": "R1",
+            "path": ["Ports", "GigabitEthernet0/0", "IP Address"],
+            "path_ids": [],
+        }
+        student_lines = [
+            "interface GigabitEthernet0/0",
+            " ip address 192.168.10.1 255.255.255.0",
+            " no shutdown",
+        ]
+        student_set = set(l.strip() for l in student_lines if l)
+        sections = _parse_config_sections(student_lines)
+        answer_lines = [
+            "interface GigabitEthernet0/0",
+            " ip address 192.168.10.1 255.255.255.0",
+            " no shutdown",
+        ]
+        initial_lines = [
+            "interface GigabitEthernet0/0",
+            " shutdown",
+        ]
+        answer_sections = _parse_config_sections(answer_lines)
+
+        result = _evaluate_ct2_item_generic(
+            item, student_lines, student_set, sections,
+            answer_lines, initial_lines, answer_sections)
+        assert result is True
+
+    def test_generic_fails_when_student_missing_line(self):
+        """Generic evaluator returns False when the student doesn't have the line."""
+        from pka_parser import _parse_config_sections
+        item = {
+            "nodeValue": "192.168.10.1",
+            "id": "IP Address",
+            "name": "IP Address",
+            "device": "R1",
+            "path": ["Ports", "GigabitEthernet0/0", "IP Address"],
+            "path_ids": [],
+        }
+        student_lines = [
+            "interface GigabitEthernet0/0",
+            " shutdown",
+        ]
+        student_set = set(l.strip() for l in student_lines if l)
+        sections = _parse_config_sections(student_lines)
+        answer_lines = [
+            "interface GigabitEthernet0/0",
+            " ip address 192.168.10.1 255.255.255.0",
+        ]
+        initial_lines = []
+        answer_sections = _parse_config_sections(answer_lines)
+
+        result = _evaluate_ct2_item_generic(
+            item, student_lines, student_set, sections,
+            answer_lines, initial_lines, answer_sections)
+        assert result is False
+
+    def test_generic_returns_none_for_empty_nodevalue(self):
+        """Generic evaluator returns None when nodeValue is empty."""
+        from pka_parser import _parse_config_sections
+        item = {
+            "nodeValue": "",
+            "id": "SomeProp",
+            "name": "SomeProp",
+            "device": "R1",
+            "path": ["Section", "SomeProp"],
+            "path_ids": [],
+        }
+        result = _evaluate_ct2_item_generic(
+            item, [], set(), _parse_config_sections([]),
+            [], [], _parse_config_sections([]))
+        assert result is None
+
+    def test_generic_excludes_initial_state_lines(self):
+        """Generic evaluator ignores lines already present in initial config."""
+        from pka_parser import _parse_config_sections
+        item = {
+            "nodeValue": "10.0.0.1",
+            "id": "IP Address",
+            "name": "IP Address",
+            "device": "R1",
+            "path": ["Section", "IP Address"],
+            "path_ids": [],
+        }
+        config_line = "ip address 10.0.0.1 255.255.255.0"
+        # The line is in both answer AND initial — so it's not required.
+        student_lines = [config_line]
+        student_set = set(student_lines)
+        sections = _parse_config_sections(student_lines)
+        answer_lines = [config_line]
+        initial_lines = [config_line]
+        answer_sections = _parse_config_sections(answer_lines)
+
+        result = _evaluate_ct2_item_generic(
+            item, student_lines, student_set, sections,
+            answer_lines, initial_lines, answer_sections)
+        # All matching answer lines were in initial → can't determine → None
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Tests for property evaluation with unsupported types (no abort)
+# ---------------------------------------------------------------------------
+
+class TestPropertyEvalNoAbort:
+    """Verify property evaluation doesn't abort on unsupported property types."""
+
+    def test_property_eval_uses_generic_for_unknown_types(self):
+        """Property evaluation returns a score even with unknown property types."""
+        import xml.etree.ElementTree as ET
+        # Build a minimal XML with 3 PT5 elements and a COMPARISONS tree
+        # containing one known item and one unknown item.
+        xml_content = b"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<PACKETTRACER5_ACTIVITY>
+  <PACKETTRACER5>
+    <NETWORK><DEVICES><DEVICE><ENGINE>
+      <NAME>R1</NAME>
+      <RUNNINGCONFIG>
+        <LINE>hostname R1</LINE>
+        <LINE>service password-encryption</LINE>
+        <LINE>ip address 10.0.0.1 255.255.255.0</LINE>
+      </RUNNINGCONFIG>
+    </ENGINE></DEVICE></DEVICES></NETWORK>
+  </PACKETTRACER5>
+  <PACKETTRACER5>
+    <NETWORK><DEVICES><DEVICE><ENGINE>
+      <NAME>R1</NAME>
+      <RUNNINGCONFIG>
+        <LINE>hostname R1</LINE>
+      </RUNNINGCONFIG>
+    </ENGINE></DEVICE></DEVICES></NETWORK>
+  </PACKETTRACER5>
+  <PACKETTRACER5>
+    <NETWORK><DEVICES><DEVICE><ENGINE>
+      <NAME>R1</NAME>
+      <RUNNINGCONFIG>
+        <LINE>hostname R1</LINE>
+        <LINE>service password-encryption</LINE>
+        <LINE>ip address 10.0.0.1 255.255.255.0</LINE>
+      </RUNNINGCONFIG>
+    </ENGINE></DEVICE></DEVICES></NETWORK>
+  </PACKETTRACER5>
+  <COMPARISONS>
+    <NODE>
+      <NAME checkType="0">Root</NAME>
+      <ID>Root</ID>
+      <POINTS></POINTS>
+      <NODE>
+        <NAME checkType="0">R1</NAME>
+        <ID>R1</ID>
+        <POINTS></POINTS>
+        <NODE>
+          <NAME checkType="2" nodeValue="1">Service Password Encryption</NAME>
+          <ID>Service Password Encryption</ID>
+          <POINTS>1</POINTS>
+        </NODE>
+        <NODE>
+          <NAME checkType="2" nodeValue="10.0.0.1">UnknownCustomProp</NAME>
+          <ID>UnknownCustomProp</ID>
+          <POINTS>1</POINTS>
+        </NODE>
+      </NODE>
+    </NODE>
+  </COMPARISONS>
+</PACKETTRACER5_ACTIVITY>
+"""
+        root = ET.fromstring(xml_content)
+        result = _score_by_property_evaluation(root)
+        # Should NOT return None (i.e. should not abort).
+        assert result is not None
+        earned, total = result
+        assert total == 2
+        # "Service Password Encryption" is known → True
+        # "UnknownCustomProp" nv="10.0.0.1" → generic fallback finds the line
+        assert earned == 2

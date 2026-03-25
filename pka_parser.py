@@ -260,6 +260,13 @@ def _score_by_property_evaluation(root):
     ``nodeValue``.  This function evaluates each item against the student's
     running-config and structured device data to produce an exact score.
 
+    For property types that have a dedicated evaluator the result is exact.
+    For unrecognised property types a generic answer-key comparison is
+    attempted: the answer-key config is searched for lines containing the
+    expected ``nodeValue``, and those lines are checked against the student
+    config.  This allows the scorer to handle *any* PKA file regardless of
+    which property types it checks.
+
     Args:
         root: The parsed XML root element.
 
@@ -281,8 +288,20 @@ def _score_by_property_evaluation(root):
 
     student_configs = _get_device_configs(pt5_elements[0])
 
+    # Answer-key and initial-state configs are used by the generic fallback
+    # evaluator when a specific evaluator is not available.
+    answer_configs = (
+        _get_device_configs(pt5_elements[2]) if len(pt5_elements) >= 3
+        else {}
+    )
+    initial_configs = (
+        _get_device_configs(pt5_elements[1]) if len(pt5_elements) >= 3
+        else {}
+    )
+
     earned = 0
-    unsupported = 0
+    generic_used = 0
+    unevaluated = 0
     for item in ct2_items:
         dev = item["device"]
         config_lines = student_configs.get(dev, [])
@@ -292,18 +311,28 @@ def _score_by_property_evaluation(root):
 
         result = _evaluate_ct2_item(item, config_lines, config_set, sections,
                                     engine)
+
         if result is None:
-            unsupported += 1
-        elif result:
+            # No dedicated evaluator — try the generic answer-key comparison.
+            answer_lines = answer_configs.get(dev, [])
+            initial_lines = initial_configs.get(dev, [])
+            answer_sections = _parse_config_sections(answer_lines)
+            result = _evaluate_ct2_item_generic(
+                item, config_lines, config_set, sections,
+                answer_lines, initial_lines, answer_sections)
+            if result is not None:
+                generic_used += 1
+            else:
+                unevaluated += 1
+
+        if result is True:
             earned += 1
 
-    # If any items use property types we don't recognise, abort so the
-    # caller can fall back to a less precise scoring strategy.
-    if unsupported > 0:
+    if generic_used > 0 or unevaluated > 0:
         logger.debug(
-            "Property evaluation aborted: %d/%d items use unsupported "
-            "property types", unsupported, len(ct2_items))
-        return None
+            "Property evaluation: %d/%d items used generic matching, "
+            "%d could not be evaluated",
+            generic_used, unevaluated, len(ct2_items))
 
     return (earned, len(ct2_items))
 
@@ -671,11 +700,261 @@ def _evaluate_ct2_item(item, config_lines, config_set, sections,
             return "inspect" in config_set
         return False
 
+    # --- Interface / port properties (Ports > {iface} > …) -----------------
+
+    if "Ports" in path:
+        iface_name = _iface_name_from_path(path)
+        iface_lines = (sections["interfaces"].get(iface_name, [])
+                       if iface_name else [])
+
+        if item_id == "IP Address":
+            return any(l.startswith("ip address ") and f" {nv} " in l
+                       for l in iface_lines)
+
+        if item_id == "Subnet Mask":
+            return any(l.startswith("ip address ") and l.endswith(nv)
+                       for l in iface_lines)
+
+        if item_id == "Port Up":
+            if nv == "1":
+                return "shutdown" not in iface_lines
+            return "shutdown" in iface_lines
+
+        if item_id == "Access VLAN":
+            return f"switchport access vlan {nv}" in iface_lines
+
+        if item_id == "Native VLAN":
+            return f"switchport trunk native vlan {nv}" in iface_lines
+
+        if item_id == "Channel Group":
+            return any(f"channel-group {nv}" in l for l in iface_lines)
+
+        if item_id == "Channel mode":
+            # 1 → active, 2 → passive, 3 → desirable, 4 → auto, 5 → on
+            mode_map = {"1": "active", "2": "passive", "3": "desirable",
+                        "4": "auto", "5": "on"}
+            kw = mode_map.get(nv)
+            if kw:
+                return any(f"mode {kw}" in l for l in iface_lines)
+            return any(f"mode {nv}" in l for l in iface_lines)
+
+        if item_id == "Bpduguard":
+            if nv == "1":
+                return "spanning-tree bpduguard enable" in iface_lines
+            return "spanning-tree bpduguard enable" not in iface_lines
+
+        if item_id == "PortFast":
+            if nv == "1":
+                return "spanning-tree portfast" in iface_lines
+            return "spanning-tree portfast" not in iface_lines
+
+        if item_id == "CDP Enabled":
+            if nv == "1":
+                # CDP is on by default; "no cdp enable" turns it off.
+                return "no cdp enable" not in iface_lines
+            return "no cdp enable" in iface_lines
+
+        if item_id == "NAT" or "NAT Mode" in path_str:
+            # 1 → inside, 2 → outside
+            if nv == "1":
+                return "ip nat inside" in iface_lines
+            if nv == "2":
+                return "ip nat outside" in iface_lines
+            return False
+
+        if item_id == "Access-group In":
+            if nv:
+                return any("ip access-group" in l and "in" in l
+                           for l in iface_lines)
+            # Empty nv means just checking the access-group exists.
+            return any("ip access-group" in l for l in iface_lines)
+
+        # Port Security sub-items
+        if "Port Security" in path:
+            if item_id == "Enabled":
+                if nv == "1":
+                    return "switchport port-security" in iface_lines
+                return "switchport port-security" not in iface_lines
+
+            if item_id == "Max Secure Mac" or "Maximum" in item_id:
+                return (f"switchport port-security maximum {nv}"
+                        in iface_lines)
+
+            if item_id == "Violation":
+                # 1 → shutdown, 2 → restrict, 3 → protect
+                viol_map = {"1": "shutdown", "2": "restrict",
+                            "3": "protect"}
+                kw = viol_map.get(nv)
+                if kw:
+                    return (f"switchport port-security violation {kw}"
+                            in iface_lines)
+                return False
+
+    # --- VLAN properties (VLANS > VLAN N > …) ------------------------------
+
+    if "VLANS" in path or "VLAN" in path_str:
+        if item_id == "VLAN Name":
+            # VLANs are stored as XML attributes on <VLAN> elements inside
+            # the ENGINE/VLANS tree, NOT in the running-config.
+            vlan_num = _vlan_num_from_path(path)
+            if engine is not None and vlan_num is not None:
+                vlans_el = engine.find("VLANS")
+                if vlans_el is not None:
+                    for vlan_el in vlans_el.findall("VLAN"):
+                        num = vlan_el.get("number", "")
+                        name = vlan_el.get("name", "")
+                        if num == str(vlan_num) and name == nv:
+                            return True
+                    return False
+            # Fallback: check running-config section.
+            if vlan_num is not None:
+                for sec_hdr, sec_lines in sections["sections"].items():
+                    if sec_hdr.strip() == f"vlan {vlan_num}":
+                        return f"name {nv}" in sec_lines
+            return f"name {nv}" in config_set
+
+    # --- OSPF extended properties ------------------------------------------
+
+    if "OSPF" in path:
+        # Extract OSPF process ID from the path (e.g. "Process ID 22").
+        ospf_id = _ospf_process_id_from_path(path)
+        ospf_section_lines = []
+        if ospf_id:
+            ospf_section_lines = sections["sections"].get(
+                f"router ospf {ospf_id}", [])
+
+        if item_id == "Router ID":
+            return f"router-id {nv}" in ospf_section_lines
+
+        if item_id == "Auto Cost":
+            return (f"auto-cost reference-bandwidth {nv}"
+                    in ospf_section_lines)
+
+        if item_id == "Default Information":
+            if nv == "1":
+                return "default-information originate" in ospf_section_lines
+            return False
+
+        if item_id.startswith("Route"):
+            # nodeValue format: "network wildcard area"
+            # e.g. "192.168.10.0 0.0.0.255 0"
+            parts = nv.split()
+            if len(parts) == 3:
+                net, wild, area = parts
+                target = f"network {net} {wild} area {area}"
+                return target in ospf_section_lines
+            # Fall through to generic if format is unexpected.
+
+        if "Passive Interface" in path:
+            # item_id is the interface name, nv is "1" (enabled).
+            if nv == "1":
+                return (f"passive-interface {item_id}"
+                        in ospf_section_lines)
+            return False
+
+    # --- Default Gateway ---------------------------------------------------
+
+    if item_id == "Default Gateway":
+        # On router/switch: ``ip default-gateway {nv}`` in config.
+        # On PC/end-devices: stored as <GATEWAY> XML element in ENGINE.
+        if f"ip default-gateway {nv}" in config_set:
+            return True
+        if engine is not None:
+            gw_el = engine.find("GATEWAY")
+            if gw_el is not None and gw_el.text:
+                return gw_el.text.strip() == nv
+        return False
+
+    # --- NAT (non-interface: NAT > Inside Source …) ------------------------
+
+    if "NAT" in path and "Inside Source Static" in path_str:
+        return any(f"ip nat inside source static {nv}".rstrip() in l
+                   for l in config_lines)
+
+    if "NAT" in path and "Inside Source List" in path_str:
+        # These items often encode complex pool/ACL references.
+        if nv:
+            return any(nv in l and "ip nat" in l for l in config_lines)
+        return False
+
+    # --- TFTP / Server Files -----------------------------------------------
+
+    if "TFTP Server" in path_str or "ServerFiles" in path_str:
+        # TFTP server files are stored in the XML FILE_MANAGER tree,
+        # not in the running-config.  The nodeValue format is
+        # "tftp:/<filename>".
+        if engine is not None:
+            target_name = nv
+            if target_name.startswith("tftp:/"):
+                target_name = target_name[len("tftp:/"):]
+            for file_el in engine.iter("FILE"):
+                name_el_file = file_el.find("NAME")
+                if (name_el_file is not None and name_el_file.text
+                        and name_el_file.text.strip() == target_name):
+                    return True
+            return False
+
     # Unrecognised property — return None so the caller can detect it and
-    # fall back to a different scoring strategy.
+    # fall back to the generic answer-key comparison.
     logger.debug("Unknown checkType=2 property: id=%s path=%s device=%s",
                  item_id, path, item.get("device", "?"))
     return None
+
+
+# ---- Generic answer-key comparison fallback ---------------------------------
+
+def _evaluate_ct2_item_generic(item, config_lines, config_set, sections,
+                               answer_lines, initial_lines,
+                               answer_sections):
+    """Attempt to evaluate a checkType=2 item using the answer-key config.
+
+    This is a best-effort fallback for property types that have no dedicated
+    evaluator.  It searches the answer-key config for lines that contain the
+    item's ``nodeValue``, excludes lines already present in the initial state,
+    and checks whether the student config contains at least one of the
+    remaining "required" lines.
+
+    Returns ``True``/``False`` if a determination can be made, or ``None``
+    if the item cannot be evaluated (e.g. empty nodeValue, or the value only
+    appears in pre-existing config).
+    """
+    nv = item["nodeValue"].strip()
+    if not nv:
+        return None
+
+    path = item["path"]
+    iface_name = _iface_name_from_path(path) if "Ports" in path else None
+
+    initial_set = set(l.strip() for l in initial_lines
+                      if l and l.strip() != "!")
+
+    # Search the answer config for lines containing the nodeValue.
+    # Scope the search to the relevant interface section if possible.
+    if iface_name:
+        search_lines = answer_sections.get("interfaces", {}).get(
+            iface_name, [])
+    else:
+        search_lines = [l.strip() for l in answer_lines
+                        if l and l.strip() != "!"]
+
+    required = []
+    for line in search_lines:
+        stripped = line.strip()
+        if stripped and nv in stripped and stripped not in initial_set:
+            required.append(stripped)
+
+    if not required:
+        # nodeValue not found in answer config — cannot evaluate.
+        return None
+
+    # Check the student config for the required lines.
+    if iface_name:
+        student_iface = sections["interfaces"].get(iface_name, [])
+        student_check = set(student_iface)
+    else:
+        student_check = config_set
+
+    return any(line in student_check for line in required)
 
 
 # ---- Path helpers -----------------------------------------------------------
@@ -721,6 +1000,28 @@ def _policy_map_name_from_path(path):
     for p in path:
         if p.startswith("Policy Map ") and "List" not in p:
             return p[len("Policy Map "):]
+    return None
+
+
+def _vlan_num_from_path(path):
+    """Extract the VLAN number from a path like ``['VLANS', 'VLAN 10', …]``."""
+    for p in path:
+        if p.startswith("VLAN "):
+            try:
+                return int(p.split(" ", 1)[1])
+            except (ValueError, IndexError):
+                pass
+    return None
+
+
+def _ospf_process_id_from_path(path):
+    """Extract the OSPF process ID from a path like ``['OSPF', 'Process ID 22', …]``."""
+    for p in path:
+        if p.startswith("Process ID "):
+            try:
+                return p.split(" ", 2)[2]
+            except IndexError:
+                pass
     return None
 
 
