@@ -1018,10 +1018,7 @@ def _ospf_process_id_from_path(path):
     """Extract the OSPF process ID from a path like ``['OSPF', 'Process ID 22', …]``."""
     for p in path:
         if p.startswith("Process ID "):
-            try:
-                return p.split(" ", 2)[2]
-            except IndexError:
-                pass
+            return p[len("Process ID "):]
     return None
 
 
