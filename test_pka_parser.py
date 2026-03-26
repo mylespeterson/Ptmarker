@@ -692,6 +692,49 @@ class TestMidtermStudentScores:
 
 
 # ---------------------------------------------------------------------------
+# Tests for ACL lab student files (numbered ACL scoring)
+# ---------------------------------------------------------------------------
+
+_SAMPLE_ACL_100 = os.path.join(
+    _SAMPLE_PKA_DIR,
+    "100-Tyler Lewis_2936342_assignsubmission_file_ACL guided lab for ES.pka",
+)
+_SAMPLE_ACL_95 = os.path.join(
+    _SAMPLE_PKA_DIR,
+    "95-Tyler Lewis_2936342_assignsubmission_file_ACLS lab for ES.pka",
+)
+_HAS_ACL_PKAS = all(
+    os.path.isfile(p) for p in [_SAMPLE_ACL_100, _SAMPLE_ACL_95]
+)
+
+
+@pytest.mark.skipif(not _HAS_ACL_PKAS, reason="ACL lab PKA files not present")
+class TestACLLabScores:
+    """Verify scoring of ACL lab student submissions with numbered ACLs."""
+
+    def test_100_file_scores_100_percent(self):
+        """The 100- prefixed file should score 100%."""
+        result = parse_pka_file(_SAMPLE_ACL_100)
+        assert result["error"] is None
+        assert result["percentage"] == "100.0%"
+
+    def test_95_file_scores_at_least_95_percent(self):
+        """The 95- prefixed file should score at least 95%."""
+        result = parse_pka_file(_SAMPLE_ACL_95)
+        assert result["error"] is None
+        pct = float(result["percentage"].rstrip("%"))
+        assert pct >= 95.0, (
+            f"Expected >= 95%, got {pct}% "
+            f"(score={result['score']}/{result['max_score']})"
+        )
+
+    def test_95_file_user_profile(self):
+        """The 95- file should have the correct user profile name."""
+        result = parse_pka_file(_SAMPLE_ACL_95)
+        assert result["user_profile_name"] == "tyler lewis"
+
+
+# ---------------------------------------------------------------------------
 # Tests for generic answer-key comparison fallback
 # ---------------------------------------------------------------------------
 
