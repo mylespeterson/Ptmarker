@@ -615,7 +615,19 @@ def _evaluate_ct2_item(item, config_lines, config_set, sections,
     # --- ACLs --------------------------------------------------------------
 
     if "ACL" in path and len(path) <= 2:
-        return nv in config_set
+        # nodeValue may contain multiple ACE lines separated by newlines.
+        ace_lines = [l.strip() for l in nv.split('\n') if l.strip()]
+        if not ace_lines:
+            return False
+        for ace in ace_lines:
+            # Named ACLs store ACEs as sub-commands (no prefix).
+            if ace in config_set:
+                continue
+            # Numbered ACLs store ACEs as "access-list <number> <ace>".
+            if f"access-list {item_id} {ace}" in config_set:
+                continue
+            return False
+        return True
 
     # --- OSPF --------------------------------------------------------------
 
