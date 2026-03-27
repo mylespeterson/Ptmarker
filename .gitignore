@@ -15,6 +15,9 @@ env/
 # Output files
 results.csv
 
+# Packet Tracer activity files
+*.pka
+
 # OS metadata
 .DS_Store
 Thumbs.db
