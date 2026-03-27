@@ -300,10 +300,13 @@ def _score_by_property_evaluation(root):
     )
 
     earned = 0
+    total_points = 0
     generic_used = 0
     unevaluated = 0
     for item in ct2_items:
         dev = item["device"]
+        weight = item.get("points", 1)
+        total_points += weight
         config_lines = student_configs.get(dev, [])
         config_set = set(l.strip() for l in config_lines if l)
         sections = _parse_config_sections(config_lines)
@@ -326,7 +329,7 @@ def _score_by_property_evaluation(root):
                 unevaluated += 1
 
         if result is True:
-            earned += 1
+            earned += weight
 
     if generic_used > 0 or unevaluated > 0:
         logger.debug(
@@ -334,14 +337,15 @@ def _score_by_property_evaluation(root):
             "%d could not be evaluated",
             generic_used, unevaluated, len(ct2_items))
 
-    return (earned, len(ct2_items))
+    return (earned, total_points)
 
 
 def _extract_ct2_items(comparisons_el):
     """Extract all ``checkType="2"`` leaf items from a COMPARISONS tree.
 
     Returns a list of dicts, each with keys ``name``, ``id``,
-    ``nodeValue``, ``device``, ``path``, and ``path_ids``.
+    ``nodeValue``, ``device``, ``path``, ``path_ids``, and ``points``.
+    Items may be worth more than 1 point (``points`` reflects the weight).
     """
     items = []
 
@@ -361,15 +365,21 @@ def _extract_ct2_items(comparisons_el):
         children = node.findall("NODE")
         current = ancestors + ((name, item_id),)
 
-        if check_type == "2" and pts == "1" and not children:
-            items.append({
-                "name": name,
-                "id": item_id,
-                "nodeValue": node_value,
-                "device": current[1][0] if len(current) > 1 else "",
-                "path": [a[0] for a in current[2:]],
-                "path_ids": [a[1] for a in current[2:]],
-            })
+        if check_type == "2" and not children:
+            try:
+                weight = int(pts)
+            except (ValueError, TypeError):
+                weight = 0
+            if weight > 0:
+                items.append({
+                    "name": name,
+                    "id": item_id,
+                    "nodeValue": node_value,
+                    "device": current[1][0] if len(current) > 1 else "",
+                    "path": [a[0] for a in current[2:]],
+                    "path_ids": [a[1] for a in current[2:]],
+                    "points": weight,
+                })
         for child in children:
             _walk(child, current)
 
@@ -604,13 +614,22 @@ def _evaluate_ct2_item(item, config_lines, config_set, sections,
         if len(parts) == 2:
             uname, secret_hash = parts
             # Username line may include ``privilege N`` before ``secret``.
+            # The secret type may be 5 (MD5), 9 (scrypt), or others.
             prefix = f"username {uname} "
-            suffix = f"secret 5 {secret_hash}"
             for line in config_lines:
                 s = line.strip()
-                if s.startswith(prefix) and s.endswith(suffix):
+                if s.startswith(prefix) and secret_hash in s:
                     return True
         return False
+
+    # --- VTY Access Class In -----------------------------------------------
+
+    if item_id == "Access Class In" and "VTY" in path_str:
+        vn = _vty_num_from_path(path)
+        if vn is not None:
+            vty_lines = _get_vty_section_lines(sections, vn)
+            return any(f"access-class {nv} in" in l for l in vty_lines)
+        return any(f"access-class {nv} in" in l for l in config_lines)
 
     # --- ACLs --------------------------------------------------------------
 
@@ -774,6 +793,47 @@ def _evaluate_ct2_item(item, config_lines, config_set, sections,
                 return "ip nat outside" in iface_lines
             return False
 
+        if item_id == "Power" and "Port Status" in path_str:
+            # Same as Port Up: nv="1" means no shutdown, nv="0" means shutdown.
+            if nv == "1":
+                return "shutdown" not in iface_lines
+            return "shutdown" in iface_lines
+
+        if item_id == "Mode" and "Tunnel Mode" in path_str:
+            # nv is the tunnel mode, e.g. "gre ip".  In IOS config:
+            # ``tunnel mode gre ip``.  GRE/IP is the default and may not
+            # appear in the running-config.
+            if nv == "gre ip":
+                # Default mode — True unless a different mode is configured.
+                return not any(l.startswith("tunnel mode ")
+                               and l != "tunnel mode gre ip"
+                               for l in iface_lines)
+            return f"tunnel mode {nv}" in iface_lines
+
+        if item_id == "Source" and "Tunnel" in (iface_name or ""):
+            return f"tunnel source {nv}" in iface_lines
+
+        if item_id == "Destination" and "Tunnel" in (iface_name or ""):
+            return f"tunnel destination {nv}" in iface_lines
+
+        if item_id == "OSPF Port Autthentication" or (
+                item_id.startswith("OSPF") and "Authentication" in path_str
+                and "Key" not in path_str):
+            # nv="2" → message-digest authentication on the interface.
+            if nv == "2":
+                return "ip ospf authentication message-digest" in iface_lines
+            return False
+
+        if item_id == "OSPF Authentication Key" or (
+                "OSPF" in path_str and "Authentication Key" in path_str):
+            return f"ip ospf authentication-key {nv}" in iface_lines
+
+        if item_id == "OSPF Hello Interval" or "OSPF Hello" in path_str:
+            return f"ip ospf hello-interval {nv}" in iface_lines
+
+        if item_id == "OSPF Dead Interval" or "OSPF Dead" in path_str:
+            return f"ip ospf dead-interval {nv}" in iface_lines
+
         if item_id == "Access-group In":
             if nv:
                 return any("ip access-group" in l and "in" in l
@@ -860,8 +920,190 @@ def _evaluate_ct2_item(item, config_lines, config_set, sections,
         if "Passive Interface" in path:
             # item_id is the interface name, nv is "1" (enabled).
             if nv == "1":
-                return (f"passive-interface {item_id}"
+                # Direct match: ``passive-interface {item_id}``
+                if f"passive-interface {item_id}" in ospf_section_lines:
+                    return True
+                # Indirect match via ``passive-interface default``:
+                # all interfaces are passive unless excluded with
+                # ``no passive-interface {item_id}``.
+                if "passive-interface default" in ospf_section_lines:
+                    return (f"no passive-interface {item_id}"
+                            not in ospf_section_lines)
+                return False
+            return False
+
+        if "Area Status" in path_str:
+            # Extract the area number from the path.
+            area_num = None
+            for p in path:
+                if p.startswith("Area "):
+                    try:
+                        area_num = p.split(" ", 1)[1]
+                    except IndexError:
+                        pass
+                    break
+            if not nv:
+                # Empty nodeValue means the area is a normal (non-stub) area.
+                # The area exists if the student has any OSPF network
+                # statement for that area.
+                if area_num is not None:
+                    return any(l.endswith(f"area {area_num}")
+                               for l in ospf_section_lines)
+                return False
+            # Non-empty nv: e.g. "4 stub" or "4 stub no-summary".
+            # IOS config: "area 4 stub" or "area 4 stub no-summary".
+            return f"area {nv}" in ospf_section_lines
+
+        if "Area Range" in path_str:
+            # nodeValue: "area_id network mask"
+            # e.g. "4 10.4.0.0 255.255.0.0"
+            # IOS config: "area 4 range 10.4.0.0 255.255.0.0"
+            parts = nv.split()
+            if len(parts) == 3:
+                area_id, net, mask = parts
+                return (f"area {area_id} range {net} {mask}"
                         in ospf_section_lines)
+            return False
+
+        if "Redistribution" in path:
+            # nodeValue: "PROTOCOL PROCESS" e.g. "EIGRP 10"
+            # IOS config: "redistribute eigrp 10 ..." (with optional params)
+            parts = nv.split()
+            if len(parts) >= 2:
+                proto = parts[0].lower()
+                proc_id = parts[1]
+                return any(l.startswith(f"redistribute {proto} {proc_id}")
+                           for l in ospf_section_lines)
+            return False
+
+    # --- Static Routes -----------------------------------------------------
+
+    if "Routes" in path and "Static Routes" in path:
+        # nodeValue format: "destination-mask_prefix_len-next_hop-metric-ad"
+        # e.g. "0.0.0.0-0-209.91.181.1-0-1"
+        parts = nv.split("-")
+        if len(parts) >= 3:
+            dest = parts[0]
+            try:
+                prefix_len = int(parts[1])
+                mask = _prefix_to_mask(prefix_len)
+            except ValueError:
+                # Might already be a dotted-decimal mask.
+                mask = parts[1]
+            next_hop = parts[2]
+            return f"ip route {dest} {mask} {next_hop}" in config_set
+        return False
+
+    # --- IP Routing --------------------------------------------------------
+
+    if item_id == "IP Routing" and "Routes" in path:
+        if nv == "1":
+            return "ip routing" in config_set
+        return "ip routing" not in config_set
+
+    # --- BGP ---------------------------------------------------------------
+
+    if "BGP" in path:
+        as_num = _bgp_as_from_path(path)
+
+        if item_id == "Autonomous System" and "Autonomous System" in path:
+            if as_num is None:
+                # The AS is in nodeValue; check for the router bgp statement.
+                return f"router bgp {nv}" in config_set
+            return f"router bgp {nv}" in config_set
+
+        if "Networks" in path and item_id.replace(" ", "").replace(".", "").isdigit() is False:
+            # BGP network: nodeValue = "network mask"
+            # e.g. "209.91.181.0 255.255.255.252"
+            # IOS config: "network 209.91.181.0 mask 255.255.255.252"
+            bgp_section = []
+            if as_num:
+                bgp_section = sections["sections"].get(
+                    f"router bgp {as_num}", [])
+            else:
+                # Try to find any BGP section.
+                for hdr, lines in sections["sections"].items():
+                    if hdr.startswith("router bgp"):
+                        bgp_section = lines
+                        break
+            parts = nv.split()
+            if len(parts) == 2:
+                net, mask = parts
+                return f"network {net} mask {mask}" in bgp_section
+            return False
+
+        if "Networks" in path:
+            # item_id like "209.91.181.0 255.255.255.252", nv is same
+            bgp_section = []
+            if as_num:
+                bgp_section = sections["sections"].get(
+                    f"router bgp {as_num}", [])
+            else:
+                for hdr, lines in sections["sections"].items():
+                    if hdr.startswith("router bgp"):
+                        bgp_section = lines
+                        break
+            parts = nv.split()
+            if len(parts) == 2:
+                net, mask = parts
+                return f"network {net} mask {mask}" in bgp_section
+            return False
+
+        if item_id == "NeighborAS" and "Neighbors" in path:
+            # Extract neighbor IP from path.
+            neighbor_ip = None
+            for p in path:
+                if p not in ("BGP", "Neighbors", "Autonomous System") and \
+                   not p.startswith("Process") and "." in p:
+                    neighbor_ip = p
+                    break
+            if neighbor_ip:
+                return f"neighbor {neighbor_ip} remote-as {nv}" in config_set
+            return False
+
+    # --- EIGRP -------------------------------------------------------------
+
+    if "EIGRP" in path:
+        eigrp_as = _eigrp_as_from_path(path)
+        eigrp_section = []
+        if eigrp_as:
+            eigrp_section = sections["sections"].get(
+                f"router eigrp {eigrp_as}", [])
+
+        if item_id == "Router ID":
+            return f"eigrp router-id {nv}" in eigrp_section
+
+        if "Networks" in path and item_id.startswith("Route"):
+            # nodeValue: "network wildcard" e.g. "172.16.1.0 0.0.0.255"
+            parts = nv.split()
+            if len(parts) == 2:
+                net, wild = parts
+                return f"network {net} {wild}" in eigrp_section
+            if len(parts) == 1:
+                return f"network {nv}" in eigrp_section
+            return False
+
+        if "Passive Interface" in path:
+            # item_id is the interface name, nv is "1" (enabled).
+            if nv == "1":
+                if f"passive-interface {item_id}" in eigrp_section:
+                    return True
+                # Handle ``passive-interface default`` pattern.
+                if "passive-interface default" in eigrp_section:
+                    return (f"no passive-interface {item_id}"
+                            not in eigrp_section)
+                return False
+            return False
+
+        if "Redistribution" in path:
+            # nodeValue: "PROTOCOL PROCESS" e.g. "OSPF 10"
+            # IOS config: "redistribute ospf 10 metric ..."
+            parts = nv.split()
+            if len(parts) >= 2:
+                proto = parts[0].lower()
+                proc_id = parts[1]
+                return any(l.startswith(f"redistribute {proto} {proc_id}")
+                           for l in eigrp_section)
             return False
 
     # --- Default Gateway ---------------------------------------------------
@@ -1031,6 +1273,50 @@ def _ospf_process_id_from_path(path):
     for p in path:
         if p.startswith("Process ID "):
             return p[len("Process ID "):]
+    return None
+
+
+def _prefix_to_mask(prefix_len):
+    """Convert a prefix length (0–32) to a dotted-decimal subnet mask."""
+    if prefix_len < 0:
+        prefix_len = 0
+    elif prefix_len > 32:
+        prefix_len = 32
+    bits = (0xFFFFFFFF << (32 - prefix_len)) & 0xFFFFFFFF
+    return f"{(bits >> 24) & 0xFF}.{(bits >> 16) & 0xFF}.{(bits >> 8) & 0xFF}.{bits & 0xFF}"
+
+
+def _bgp_as_from_path(path):
+    """Extract the BGP AS number from a COMPARISONS path list.
+
+    Looks for ``'Autonomous System'`` in the path; if the element *before*
+    it starts with ``'BGP'``, the AS is typically encoded elsewhere (in the
+    nodeValue).  Otherwise, the AS may appear in a path element like
+    ``'Autonomous System 2014'``.
+
+    Falls back to searching for a ``router bgp`` section header pattern.
+    """
+    # The BGP section in config is "router bgp <AS>".  We can try to
+    # extract the AS from path elements.
+    for p in path:
+        if p.startswith("Autonomous System ") and "Neighbors" not in path:
+            rest = p[len("Autonomous System "):]
+            if rest.isdigit():
+                return rest
+    return None
+
+
+def _eigrp_as_from_path(path):
+    """Extract the EIGRP autonomous system number from a path.
+
+    Looks for ``'Autonomous System N'`` in the path, e.g.
+    ``['EIGRP', 'Autonomous System 10', 'Networks', …]``.
+    """
+    for p in path:
+        if p.startswith("Autonomous System "):
+            rest = p[len("Autonomous System "):]
+            if rest.isdigit():
+                return rest
     return None
 
 
