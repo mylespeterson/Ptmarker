@@ -835,6 +835,8 @@ def _evaluate_ct2_item(item, config_lines, config_set, sections,
         if item_id == "Destination" and "Tunnel" in (iface_name or ""):
             return f"tunnel destination {nv}" in iface_lines
 
+        # Note: "Autthentication" is the actual spelling used in the PKA
+        # XML item ID (a typo in Packet Tracer's data format).
         if item_id == "OSPF Port Autthentication" or (
                 item_id.startswith("OSPF") and "Authentication" in path_str
                 and "Key" not in path_str):
@@ -1031,28 +1033,10 @@ def _evaluate_ct2_item(item, config_lines, config_set, sections,
                 return f"router bgp {nv}" in config_set
             return f"router bgp {nv}" in config_set
 
-        if "Networks" in path and item_id.replace(" ", "").replace(".", "").isdigit() is False:
+        if "Networks" in path:
             # BGP network: nodeValue = "network mask"
             # e.g. "209.91.181.0 255.255.255.252"
             # IOS config: "network 209.91.181.0 mask 255.255.255.252"
-            bgp_section = []
-            if as_num:
-                bgp_section = sections["sections"].get(
-                    f"router bgp {as_num}", [])
-            else:
-                # Try to find any BGP section.
-                for hdr, lines in sections["sections"].items():
-                    if hdr.startswith("router bgp"):
-                        bgp_section = lines
-                        break
-            parts = nv.split()
-            if len(parts) == 2:
-                net, mask = parts
-                return f"network {net} mask {mask}" in bgp_section
-            return False
-
-        if "Networks" in path:
-            # item_id like "209.91.181.0 255.255.255.252", nv is same
             bgp_section = []
             if as_num:
                 bgp_section = sections["sections"].get(
