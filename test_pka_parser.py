@@ -918,8 +918,158 @@ class TestPropertyEvalNoAbort:
         result = _score_by_property_evaluation(root)
         # Should NOT return None (i.e. should not abort).
         assert result is not None
-        earned, total = result
+        earned, total, feedback = result
         assert total == 2
         # "Service Password Encryption" is known → True
         # "UnknownCustomProp" nv="10.0.0.1" → generic fallback finds the line
         assert earned == 2
+        assert isinstance(feedback, list)
+
+
+# ---------------------------------------------------------------------------
+# Tests for CET1027 Skills Exam student files (weighted property evaluation)
+# ---------------------------------------------------------------------------
+
+_SAMPLE_SKILLS_GABRIEL = os.path.join(
+    _SAMPLE_PKA_DIR, "24-CET1027-SkillsExam2026_gabriel.pka")
+_SAMPLE_SKILLS_SUPRIYA = os.path.join(
+    _SAMPLE_PKA_DIR, "46-CET1027-SkillsExam2026_SupriyaSitory.pka")
+_SAMPLE_SKILLS_PIERRE = os.path.join(
+    _SAMPLE_PKA_DIR, "69-CET1027-SkillsExam2026_PierreBergeron_A00280020.pka")
+_SAMPLE_SKILLS_DHARMIL = os.path.join(
+    _SAMPLE_PKA_DIR, "81-CET1027-SkillsExam2026_Dharmil.pka")
+_SAMPLE_SKILLS_KASHISH = os.path.join(
+    _SAMPLE_PKA_DIR, "89-CET1027-SkillsExam2026_Kashish.pka")
+
+_HAS_SKILLS_PKAS = all(
+    os.path.isfile(p) for p in [
+        _SAMPLE_SKILLS_GABRIEL, _SAMPLE_SKILLS_SUPRIYA,
+        _SAMPLE_SKILLS_PIERRE, _SAMPLE_SKILLS_DHARMIL,
+        _SAMPLE_SKILLS_KASHISH,
+    ]
+)
+
+
+@pytest.mark.skipif(not _HAS_SKILLS_PKAS,
+                    reason="CET1027 Skills Exam PKA files not present")
+class TestSkillsExamScores:
+    """Verify scoring of CET1027 Skills Exam student submissions."""
+
+    def test_scores_within_tolerance(self):
+        """Each student file scores within 2% of the expected percentage."""
+        expected = {
+            _SAMPLE_SKILLS_GABRIEL: (24, "gabriel"),
+            _SAMPLE_SKILLS_SUPRIYA: (46, "Supriya Sitory"),
+            _SAMPLE_SKILLS_PIERRE: (69, "Pierre Bergeron"),
+            _SAMPLE_SKILLS_DHARMIL: (81, "Dharmil"),
+            _SAMPLE_SKILLS_KASHISH: (89, "kashish"),
+        }
+        for path, (exp_pct, _) in expected.items():
+            result = parse_pka_file(path)
+            assert result["error"] is None, (
+                f"{os.path.basename(path)}: {result['error']}")
+            pct = float(result["percentage"].rstrip("%"))
+            assert abs(pct - exp_pct) <= 2, (
+                f"{os.path.basename(path)}: expected ~{exp_pct}%, got {pct}% "
+                f"(score={result['score']}/{result['max_score']})")
+
+    def test_max_score_is_128(self):
+        """All Skills Exam files should have max_score of 128."""
+        result = parse_pka_file(_SAMPLE_SKILLS_KASHISH)
+        assert result["error"] is None
+        assert int(result["max_score"]) == 128
+
+    def test_score_ordering(self):
+        """Scores should reflect relative student performance."""
+        paths = [
+            _SAMPLE_SKILLS_GABRIEL, _SAMPLE_SKILLS_SUPRIYA,
+            _SAMPLE_SKILLS_PIERRE, _SAMPLE_SKILLS_DHARMIL,
+            _SAMPLE_SKILLS_KASHISH,
+        ]
+        pcts = []
+        for path in paths:
+            result = parse_pka_file(path)
+            pcts.append(float(result["percentage"].rstrip("%")))
+        # Should be strictly increasing.
+        for i in range(len(pcts) - 1):
+            assert pcts[i] < pcts[i + 1], (
+                f"Score ordering violated: {pcts}")
+
+    def test_feedback_present_for_imperfect_score(self):
+        """Students with imperfect scores should have feedback items."""
+        result = parse_pka_file(_SAMPLE_SKILLS_KASHISH)
+        assert result["error"] is None
+        feedback = result.get("feedback", [])
+        assert len(feedback) > 0, "Expected feedback items for 89% student"
+
+    def test_feedback_has_required_keys(self):
+        """Each feedback item should have the expected keys."""
+        result = parse_pka_file(_SAMPLE_SKILLS_KASHISH)
+        for fb in result.get("feedback", []):
+            assert "device" in fb
+            assert "property" in fb
+            assert "expected" in fb
+            assert "student" in fb
+            assert "points" in fb
+
+    def test_feedback_count_reflects_missing_points(self):
+        """Number of feedback items should correspond to missed items."""
+        result = parse_pka_file(_SAMPLE_SKILLS_GABRIEL)
+        feedback = result.get("feedback", [])
+        score = int(result["score"])
+        max_score = int(result["max_score"])
+        # Total missed points should equal sum of feedback item points.
+        missed_from_feedback = sum(fb["points"] for fb in feedback)
+        assert missed_from_feedback == max_score - score
+
+
+# ---------------------------------------------------------------------------
+# Tests for feedback CSV output
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _HAS_SKILLS_PKAS,
+                    reason="CET1027 Skills Exam PKA files not present")
+class TestFeedbackCSVOutput:
+    """Verify that the feedback CSV is written correctly."""
+
+    def test_feedback_csv_is_created(self):
+        """A feedback CSV file should be created alongside the summary."""
+        from csv_writer import write_results
+        result = parse_pka_file(_SAMPLE_SKILLS_KASHISH)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary_path = os.path.join(tmpdir, "results.csv")
+            write_results([result], summary_path)
+            feedback_path = os.path.join(tmpdir, "results_feedback.csv")
+            assert os.path.isfile(feedback_path), (
+                "Feedback CSV should be created")
+
+    def test_feedback_csv_has_correct_headers(self):
+        """The feedback CSV should have the expected column headers."""
+        import csv as csv_mod
+        from csv_writer import write_results, FEEDBACK_FIELDNAMES
+        result = parse_pka_file(_SAMPLE_SKILLS_KASHISH)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary_path = os.path.join(tmpdir, "results.csv")
+            write_results([result], summary_path)
+            feedback_path = os.path.join(tmpdir, "results_feedback.csv")
+            with open(feedback_path, encoding="utf-8") as f:
+                reader = csv_mod.reader(f)
+                headers = next(reader)
+            assert headers == FEEDBACK_FIELDNAMES
+
+    def test_feedback_csv_row_count(self):
+        """Feedback CSV row count should match the number of incorrect items."""
+        import csv as csv_mod
+        from csv_writer import write_results
+        result = parse_pka_file(_SAMPLE_SKILLS_KASHISH)
+        expected_rows = len(result.get("feedback", []))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary_path = os.path.join(tmpdir, "results.csv")
+            write_results([result], summary_path)
+            feedback_path = os.path.join(tmpdir, "results_feedback.csv")
+            with open(feedback_path, encoding="utf-8") as f:
+                reader = csv_mod.reader(f)
+                next(reader)  # skip header
+                rows = list(reader)
+            assert len(rows) == expected_rows

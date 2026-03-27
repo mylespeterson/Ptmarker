@@ -95,6 +95,14 @@ def main(argv=None):
         return 1
 
     print(f"Results written to '{args.output}' ({total} file(s) processed).")
+
+    # Mention the feedback file if it was created.
+    import os
+    base, ext = os.path.splitext(args.output)
+    feedback_path = f"{base}_feedback{ext}"
+    if os.path.isfile(feedback_path):
+        print(f"Detailed feedback written to '{feedback_path}'.")
+
     return 0
 
 
