@@ -271,8 +271,10 @@ def _score_by_property_evaluation(root):
         root: The parsed XML root element.
 
     Returns:
-        A tuple ``(earned, total)`` of integers, or ``None`` if the
-        evaluation cannot be performed.
+        A tuple ``(earned, total, feedback)`` where *earned* and *total* are
+        integers and *feedback* is a list of dicts (one per incorrect item)
+        with keys ``device``, ``property``, ``expected``, ``student``, and
+        ``points``.  Returns ``None`` if the evaluation cannot be performed.
     """
     comparisons = root.find(".//COMPARISONS")
     if comparisons is None:
@@ -303,6 +305,7 @@ def _score_by_property_evaluation(root):
     total_points = 0
     generic_used = 0
     unevaluated = 0
+    feedback = []
     for item in ct2_items:
         dev = item["device"]
         weight = item.get("points", 1)
@@ -330,6 +333,22 @@ def _score_by_property_evaluation(root):
 
         if result is True:
             earned += weight
+        else:
+            # Collect feedback for incorrect / unevaluated items.
+            answer_lines = answer_configs.get(dev, [])
+            answer_sections = _parse_config_sections(answer_lines)
+            expected_desc = _describe_expected(item, answer_lines,
+                                               answer_sections)
+            student_desc = _describe_student(item, config_lines, config_set,
+                                             sections, engine)
+            prop_path = "/".join(item["path"])
+            feedback.append({
+                "device": dev,
+                "property": prop_path,
+                "expected": expected_desc,
+                "student": student_desc,
+                "points": weight,
+            })
 
     if generic_used > 0 or unevaluated > 0:
         logger.debug(
@@ -337,7 +356,7 @@ def _score_by_property_evaluation(root):
             "%d could not be evaluated",
             generic_used, unevaluated, len(ct2_items))
 
-    return (earned, total_points)
+    return (earned, total_points, feedback)
 
 
 def _extract_ct2_items(comparisons_el):
@@ -1155,6 +1174,442 @@ def _evaluate_ct2_item(item, config_lines, config_set, sections,
     return None
 
 
+# ---- Feedback description helpers -------------------------------------------
+
+# Maps that translate numeric nodeValue codes to human-readable names for
+# specific property types, so the feedback output is understandable.
+_NAT_MODE_MAP = {"1": "inside", "2": "outside"}
+_TRANSPORT_MAP = {"2": "SSH"}
+_LOGIN_MAP = {"2": "login local"}
+_AUTH_MAP = {"2": "message-digest"}
+
+
+def _expected_config_line(item, answer_lines, answer_sections):
+    """Return the IOS config line(s) that the student should have configured.
+
+    This translates the item's ``nodeValue`` into a human-readable
+    representation of the expected configuration.
+    """
+    nv = item["nodeValue"].strip()
+    item_id = item["id"]
+    path = item["path"]
+    path_str = " ".join(path)
+
+    # --- Interface-scoped properties ---
+    if "Ports" in path:
+        iface_name = _iface_name_from_path(path)
+        prefix = f"interface {iface_name}: " if iface_name else ""
+
+        if item_id == "IP Address":
+            return f"{prefix}ip address {nv} ..."
+        if item_id == "Subnet Mask":
+            return f"{prefix}ip address ... {nv}"
+        if item_id in ("Port Up", "Power"):
+            return f"{prefix}{'no shutdown' if nv == '1' else 'shutdown'}"
+        if item_id in ("NAT", "NAT Mode") or "NAT Mode" in path_str:
+            mode = _NAT_MODE_MAP.get(nv, nv)
+            return f"{prefix}ip nat {mode}"
+        if item_id == "Mode" and "Tunnel" in path_str:
+            return f"{prefix}tunnel mode {nv}"
+        if item_id == "Source" and "Tunnel" in (iface_name or ""):
+            return f"{prefix}tunnel source {nv}"
+        if item_id == "Destination" and "Tunnel" in (iface_name or ""):
+            return f"{prefix}tunnel destination {nv}"
+        if "OSPF Authentication Key" in path_str:
+            return f"{prefix}ip ospf authentication-key {nv}"
+        if "OSPF Authentication" in path_str and "Key" not in path_str:
+            return f"{prefix}ip ospf authentication message-digest"
+        if "OSPF Hello" in path_str:
+            return f"{prefix}ip ospf hello-interval {nv}"
+        if "OSPF Dead" in path_str:
+            return f"{prefix}ip ospf dead-interval {nv}"
+        if item_id == "Access VLAN":
+            return f"{prefix}switchport access vlan {nv}"
+        if item_id == "Native VLAN":
+            return f"{prefix}switchport trunk native vlan {nv}"
+        if item_id == "Bpduguard" and nv == "1":
+            return f"{prefix}spanning-tree bpduguard enable"
+        if item_id == "PortFast" and nv == "1":
+            return f"{prefix}spanning-tree portfast"
+        if "Port Security" in path:
+            if item_id == "Enabled" and nv == "1":
+                return f"{prefix}switchport port-security"
+            if "Maximum" in item_id or item_id == "Max Secure Mac":
+                return f"{prefix}switchport port-security maximum {nv}"
+            if item_id == "Violation":
+                viol = {"1": "shutdown", "2": "restrict", "3": "protect"
+                        }.get(nv, nv)
+                return f"{prefix}switchport port-security violation {viol}"
+        if item_id == "Access-group In":
+            return f"{prefix}ip access-group ... in"
+        return f"{prefix}{nv}"
+
+    # --- OSPF ---
+    if "OSPF" in path:
+        ospf_id = _ospf_process_id_from_path(path)
+        prefix = f"router ospf {ospf_id}: " if ospf_id else ""
+        if item_id == "Router ID":
+            return f"{prefix}router-id {nv}"
+        if item_id == "Auto Cost":
+            return f"{prefix}auto-cost reference-bandwidth {nv}"
+        if item_id == "Default Information" and nv == "1":
+            return f"{prefix}default-information originate"
+        if item_id.startswith("Route") and "Networks" in path:
+            parts = nv.split()
+            if len(parts) == 3:
+                return f"{prefix}network {parts[0]} {parts[1]} area {parts[2]}"
+        if "Passive Interface" in path:
+            return f"{prefix}passive-interface {item_id}"
+        if "Area Status" in path_str:
+            if not nv:
+                return f"{prefix}area exists (network statements for area)"
+            return f"{prefix}area {nv}"
+        if "Area Range" in path_str:
+            parts = nv.split()
+            if len(parts) == 3:
+                return f"{prefix}area {parts[0]} range {parts[1]} {parts[2]}"
+        if "Redistribution" in path:
+            parts = nv.split()
+            if len(parts) >= 2:
+                return (f"{prefix}redistribute {parts[0].lower()} "
+                        f"{parts[1]} ...")
+        if "Area Authentication" in path:
+            return f"{prefix}area {item_id} authentication message-digest"
+
+    # --- BGP ---
+    if "BGP" in path:
+        if item_id == "Autonomous System":
+            return f"router bgp {nv}"
+        if "Networks" in path:
+            parts = nv.split()
+            if len(parts) == 2:
+                return f"network {parts[0]} mask {parts[1]}"
+        if item_id == "NeighborAS":
+            neighbor_ip = None
+            for p in path:
+                if p not in ("BGP", "Neighbors", "Autonomous System") and \
+                   "." in p:
+                    neighbor_ip = p
+                    break
+            if neighbor_ip:
+                return f"neighbor {neighbor_ip} remote-as {nv}"
+
+    # --- EIGRP ---
+    if "EIGRP" in path:
+        eigrp_as = _eigrp_as_from_path(path)
+        prefix = f"router eigrp {eigrp_as}: " if eigrp_as else ""
+        if item_id == "Router ID":
+            return f"{prefix}eigrp router-id {nv}"
+        if "Networks" in path:
+            parts = nv.split()
+            if len(parts) == 2:
+                return f"{prefix}network {parts[0]} {parts[1]}"
+            return f"{prefix}network {nv}"
+        if "Passive Interface" in path:
+            return f"{prefix}passive-interface {item_id}"
+        if "Redistribution" in path:
+            parts = nv.split()
+            if len(parts) >= 2:
+                return (f"{prefix}redistribute {parts[0].lower()} "
+                        f"{parts[1]} ...")
+
+    # --- Static Routes ---
+    if "Static Routes" in path:
+        parts = nv.split("-")
+        if len(parts) >= 3:
+            dest = parts[0]
+            try:
+                mask = _prefix_to_mask(int(parts[1]))
+            except ValueError:
+                mask = parts[1]
+            return f"ip route {dest} {mask} {parts[2]}"
+
+    # --- Other global properties ---
+    if item_id == "IP Routing":
+        return "ip routing" if nv == "1" else "no ip routing"
+    if item_id == "Enable Secret":
+        return f"enable secret ... (hash: {nv[:20]}...)"
+    if item_id == "IP Domain Name":
+        return f"ip domain-name {nv}"
+    if item_id == "SSH Server Version":
+        return f"ip ssh version {nv}"
+    if item_id == "Transport Input":
+        return f"transport input {_TRANSPORT_MAP.get(nv, nv)}"
+    if item_id == "Login":
+        return _LOGIN_MAP.get(nv, f"login ({nv})")
+    if item_id == "Access Class In":
+        return f"access-class {nv} in"
+    if item_id == "Default Gateway":
+        return f"ip default-gateway {nv}"
+    if "User Names" in path:
+        parts = nv.split(" ", 1)
+        if len(parts) == 2:
+            return f"username {parts[0]} secret ..."
+    if "ACL" in path:
+        return nv.replace("\n", "; ")
+
+    return nv
+
+
+def _describe_expected(item, answer_lines, answer_sections):
+    """Return a human-readable description of the expected configuration."""
+    return _expected_config_line(item, answer_lines, answer_sections)
+
+
+def _describe_student(item, config_lines, config_set, sections, engine):
+    """Return a description of what the student actually configured.
+
+    Searches the student config for lines related to the item's property and
+    returns what was found (or ``(not configured)`` if nothing matches).
+    """
+    nv = item["nodeValue"].strip()
+    item_id = item["id"]
+    path = item["path"]
+    path_str = " ".join(path)
+
+    # --- Interface-scoped properties ---
+    if "Ports" in path:
+        iface_name = _iface_name_from_path(path)
+        iface_lines = (sections["interfaces"].get(iface_name, [])
+                       if iface_name else [])
+
+        if item_id == "IP Address":
+            for l in iface_lines:
+                if l.startswith("ip address "):
+                    return l
+            return "(not configured)"
+
+        if item_id == "Subnet Mask":
+            for l in iface_lines:
+                if l.startswith("ip address "):
+                    return l
+            return "(not configured)"
+
+        if item_id in ("Port Up", "Power"):
+            if "shutdown" in iface_lines:
+                return "shutdown"
+            return "no shutdown"
+
+        if item_id in ("NAT", "NAT Mode") or "NAT Mode" in path_str:
+            for l in iface_lines:
+                if "ip nat" in l:
+                    return l
+            return "(not configured)"
+
+        if item_id == "Mode" and "Tunnel" in path_str:
+            for l in iface_lines:
+                if l.startswith("tunnel mode "):
+                    return l
+            return "(default: tunnel mode gre ip)"
+
+        if item_id == "Source" and "Tunnel" in (iface_name or ""):
+            for l in iface_lines:
+                if l.startswith("tunnel source "):
+                    return l
+            return "(not configured)"
+
+        if item_id == "Destination" and "Tunnel" in (iface_name or ""):
+            for l in iface_lines:
+                if l.startswith("tunnel destination "):
+                    return l
+            return "(not configured)"
+
+        if "OSPF" in path_str:
+            keyword = None
+            if "Authentication Key" in path_str:
+                # Look for authentication-key or message-digest-key.
+                for l in iface_lines:
+                    if "ip ospf authentication-key" in l or \
+                       "ip ospf message-digest-key" in l:
+                        return l
+                return "(not configured)"
+            elif "Authentication" in path_str:
+                keyword = "ip ospf authentication"
+            elif "Hello" in path_str:
+                keyword = "ip ospf hello-interval"
+            elif "Dead" in path_str:
+                keyword = "ip ospf dead-interval"
+            if keyword:
+                for l in iface_lines:
+                    if keyword in l:
+                        return l
+                return "(not configured)"
+
+    # --- Routing protocol sections ---
+    section_key = None
+    section_lines = []
+
+    if "OSPF" in path:
+        ospf_id = _ospf_process_id_from_path(path)
+        if ospf_id:
+            section_key = f"router ospf {ospf_id}"
+            section_lines = sections["sections"].get(section_key, [])
+    elif "EIGRP" in path:
+        eigrp_as = _eigrp_as_from_path(path)
+        if eigrp_as:
+            section_key = f"router eigrp {eigrp_as}"
+            section_lines = sections["sections"].get(section_key, [])
+    elif "BGP" in path:
+        for hdr in sections["sections"]:
+            if hdr.startswith("router bgp"):
+                section_key = hdr
+                section_lines = sections["sections"][hdr]
+                break
+
+    if section_key and not section_lines:
+        return f"({section_key} section not found)"
+
+    if section_lines:
+        if "Passive Interface" in path:
+            found = [l for l in section_lines
+                     if "passive-interface" in l
+                     and (item_id in l or "default" in l)]
+            return "; ".join(found) if found else "(not configured)"
+
+        if item_id == "Router ID":
+            for l in section_lines:
+                if "router-id" in l or "eigrp router-id" in l:
+                    return l
+            return "(not configured)"
+
+        if item_id == "Auto Cost":
+            for l in section_lines:
+                if "auto-cost" in l:
+                    return l
+            return "(not configured)"
+
+        if "Networks" in path and item_id.startswith("Route"):
+            found = [l for l in section_lines if l.startswith("network ")]
+            return "; ".join(found) if found else "(not configured)"
+
+        if "Networks" in path:
+            # BGP networks
+            found = [l for l in section_lines if l.startswith("network ")]
+            return "; ".join(found) if found else "(not configured)"
+
+        if item_id == "NeighborAS":
+            neighbor_ip = None
+            for p in path:
+                if p not in ("BGP", "Neighbors", "Autonomous System") and \
+                   "." in p:
+                    neighbor_ip = p
+                    break
+            if neighbor_ip:
+                for l in section_lines:
+                    if f"neighbor {neighbor_ip}" in l:
+                        return l
+            return "(not configured)"
+
+        if "Area Status" in path_str:
+            found = [l for l in section_lines
+                     if l.startswith("area ") or "network" in l]
+            return "; ".join(found[:5]) if found else "(not configured)"
+
+        if "Area Range" in path_str:
+            found = [l for l in section_lines if "range" in l]
+            return "; ".join(found) if found else "(not configured)"
+
+        if "Redistribution" in path:
+            found = [l for l in section_lines if "redistribute" in l]
+            return "; ".join(found) if found else "(not configured)"
+
+        if item_id == "Default Information":
+            for l in section_lines:
+                if "default-information" in l:
+                    return l
+            return "(not configured)"
+
+    # --- Static Routes ---
+    if "Static Routes" in path:
+        found = [l.strip() for l in config_lines if "ip route " in l]
+        return "; ".join(found) if found else "(not configured)"
+
+    # --- Other global properties ---
+    if item_id == "IP Routing":
+        return "ip routing" if "ip routing" in config_set else "(not configured)"
+
+    if item_id == "Autonomous System" and "BGP" in path:
+        for hdr in sections["sections"]:
+            if hdr.startswith("router bgp"):
+                return hdr
+        return "(not configured)"
+
+    if item_id == "Enable Secret":
+        for l in config_lines:
+            if l.strip().startswith("enable secret"):
+                return l.strip()
+        return "(not configured)"
+
+    if item_id == "IP Domain Name":
+        for l in config_lines:
+            if "ip domain-name" in l:
+                return l.strip()
+        return "(not configured)"
+
+    if item_id == "SSH Server Version":
+        for l in config_lines:
+            if "ip ssh version" in l:
+                return l.strip()
+        return "(not configured)"
+
+    if item_id == "Transport Input":
+        # Check VTY sections
+        for _, _, lines in sections["vty_ranges"]:
+            for l in lines:
+                if "transport input" in l:
+                    return l
+        return "(not configured)"
+
+    if item_id == "Access Class In":
+        for _, _, lines in sections["vty_ranges"]:
+            for l in lines:
+                if "access-class" in l:
+                    return l
+        return "(not configured)"
+
+    if "User Names" in path:
+        parts = nv.split(" ", 1)
+        if parts:
+            uname = parts[0]
+            for l in config_lines:
+                if l.strip().startswith(f"username {uname} "):
+                    return l.strip()
+        return "(not configured)"
+
+    if "ACL" in path:
+        acl_name = item_id
+        # Look for ACL lines in config
+        found = []
+        in_acl = False
+        for l in config_lines:
+            s = l.strip()
+            if s == f"ip access-list standard {acl_name}" or \
+               s == f"ip access-list extended {acl_name}":
+                in_acl = True
+                found.append(s)
+                continue
+            if in_acl:
+                if s.startswith("permit ") or s.startswith("deny "):
+                    found.append(s)
+                elif s and s != "!":
+                    break
+            if s.startswith(f"access-list {acl_name} "):
+                found.append(s)
+        return "; ".join(found) if found else "(not configured)"
+
+    if item_id == "Default Gateway":
+        for l in config_lines:
+            if "ip default-gateway" in l:
+                return l.strip()
+        if engine is not None:
+            gw_el = engine.find("GATEWAY")
+            if gw_el is not None and gw_el.text:
+                return f"gateway: {gw_el.text.strip()}"
+        return "(not configured)"
+
+    return "(not determined)"
+
+
 # ---- Generic answer-key comparison fallback ---------------------------------
 
 def _evaluate_ct2_item_generic(item, config_lines, config_set, sections,
@@ -1397,9 +1852,10 @@ def _parse_xml_for_scores(xml_bytes):
     if result["score"] is None and result["max_score"] is None:
         prop_result = _score_by_property_evaluation(root)
         if prop_result is not None:
-            earned, total = prop_result
+            earned, total, feedback = prop_result
             result["score"] = str(earned)
             result["max_score"] = str(total)
+            result["feedback"] = feedback
 
     # --- Running-config comparison fallback --------------------------------
     # When the COMPARISONS tree has no checkType="2" items (or doesn't exist)
@@ -1454,6 +1910,10 @@ def _apply_parsed_scores(base_result, parsed, filename):
     profile = parsed.get("user_profile_name") or "N/A"
 
     base_result["user_profile_name"] = profile
+
+    # Transfer per-item feedback if present.
+    if "feedback" in parsed:
+        base_result["feedback"] = parsed["feedback"]
 
     # Calculate percentage.
     if score_str and max_str:
